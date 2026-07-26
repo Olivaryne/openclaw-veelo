@@ -74,9 +74,10 @@ owner in the Reason column.
 
 ## Audit
 
-- SRV formal owners (34): A01–A03, A05–A30, A32–A35, A37, A42–A45.
+- SRV formal owners (38): A01–A03, A05–A30, A32–A35, A37, A42–A45.
 - COMPAT formal owners (5): A36, A38–A41.
 - BIND formal owners (3): A04, A31, A46.
+- Audit arithmetic: SRV 38 (3 + 26 + 4 + 1 + 4) + COMPAT 5 + BIND 3 = 46.
 - Unassigned rows: none. Duplicate owners: none. Total: 46.
 - Parent-contract change required: none.
 - Cross-boundary rows and their final-integration-evidence owners: A04 →

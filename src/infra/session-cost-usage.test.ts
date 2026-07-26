@@ -2515,7 +2515,7 @@ describe("session cost usage", () => {
               "hello there",
               "[message_id: abc123]",
               "",
-              "Context:",
+              markInboundContextLabel("Context:"),
               '<<<EXTERNAL_UNTRUSTED_CONTENT id="deadbeefdeadbeef">>>',
               "Source: Channel metadata",
               "---",

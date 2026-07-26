@@ -603,7 +603,8 @@ export const it: TranslationMap = {
     worktreeNameInvalid: "I nomi dei worktree usano lettere minuscole, cifre e trattini.",
     incognito: "In incognito",
     incognitoDescription: "Mantieni questo thread solo fino al riavvio del Gateway",
-    startAsDraft: "Inizia come bozza",
+    draft: "Bozza",
+    draftDescription: "Mantieni questa conversazione privata finché non la pubblichi",
     messagePlaceholder: "Su cosa dovrebbe lavorare questa sessione?",
     readingAttachment: "Lettura allegato",
     start: "Avvia sessione",
@@ -736,6 +737,7 @@ export const it: TranslationMap = {
     runErrorTimedOut: "Tempo scaduto",
     runErrorUnknown: "Errore sconosciuto",
     attentionRequired: "La sessione richiede attenzione",
+    openSession: "Apri conversazione",
     model: "Modello",
     provider: "Provider",
     runtime: "Runtime",
@@ -3232,13 +3234,17 @@ export const it: TranslationMap = {
       on: "Dreaming attivo",
       off: "Dreaming disattivo",
     },
-    restartConfirmation: {
-      title: "Riavvia il Gateway per applicare la modifica",
-      subtitle: "La modifica della modalità Dreaming riavvia il gateway.",
-      warning:
-        "Questa azione riavvierà il Gateway e potrebbe interrompere temporaneamente chat, automazioni e canali connessi.",
-      confirm: "Conferma riavvio",
-      restarting: "Riavvio…",
+    toggleConfirmation: {
+      subtitle: "Dreaming è un'impostazione globale; non è limitata a questo agente.",
+      enableTitle: "Attiva Dreaming per tutti gli agenti",
+      enableDetail:
+        "La scansione notturna di dreaming verrà eseguita su ogni workspace di agente configurato, promuovendo i ricordi a breve termine nella memoria a lungo termine. Questo si applica immediatamente.",
+      enableConfirm: "Attiva Dreaming",
+      disableTitle: "Disattiva Dreaming per tutti gli agenti",
+      disableDetail:
+        "La scansione notturna di dreaming si interromperà per ogni agente configurato, non solo per questo. I ricordi già scritti rimangono; nulla di nuovo viene promosso. Questo si applica immediatamente.",
+      disableConfirm: "Disattiva Dreaming",
+      saving: "Salvataggio…",
       failed: "Impossibile applicare la modifica. Controlla la connessione e riprova.",
     },
     status: {
@@ -3897,6 +3903,11 @@ export const it: TranslationMap = {
     },
     outputTokens: "{count} token di output",
     archivedSessionDisabled: "Ripristina questa sessione per inviare messaggi.",
+    sessionRoute: {
+      chooseTitle: "Scegli una sessione",
+      multipleMatches: "Più di una sessione corrisponde a {shortId}.",
+      additionalMatches: "Restano altri risultati di ricerca. Usa un prefisso id più lungo.",
+    },
     sessionSharing: {
       menu: "Condivisione thread",
       current: "Visibilità thread: {visibility}",
@@ -3948,6 +3959,15 @@ export const it: TranslationMap = {
       oneMessage: "{count} messaggio",
       messages: "{count} messaggi",
       activeBranch: "Ramo attivo",
+      gatewayPicker: {
+        menuLabel: "Gateway: {gateway}",
+        primaryTag: "primario",
+        setPrimary: "Imposta come primario…",
+        openSettings: "Impostazioni Gateway…",
+        connected: "Connesso",
+        unreachable: "Non raggiungibile",
+        unknown: "Stato sconosciuto",
+      },
     },
     board: {
       faceLabel: "Vista del thread",
@@ -4139,7 +4159,9 @@ export const it: TranslationMap = {
       threads: "Thread",
       groups: "Gruppi",
       coding: "Programmazione",
-      groupCatalogSessionsByProject: "Raggruppa per progetto",
+      catalogViewOptions: "Opzioni di visualizzazione",
+      catalogGroupByProject: "Progetto",
+      catalogGroupByPerson: "Persona",
       openSessionMenu: "Open session menu",
       sortBy: "Ordina per",
       sortCreated: "Creato",
@@ -4318,6 +4340,16 @@ export const it: TranslationMap = {
       renderedMarkdownHint: "Anteprima rich-text sanificata per una lettura rapida.",
       noPreviewableMarkdown: "Nessun contenuto markdown visualizzabile in anteprima.",
       noContent: "Nessun contenuto disponibile",
+    },
+    sidebarColumns: {
+      chat: "Chat",
+      discussion: "Discussione",
+      detail: "Dettagli",
+      close: "Chiudi {panel}",
+      drag: "Trascina {panel}",
+      dropOnEmptyLeft: "Sposta {panel} nella barra laterale sinistra vuota",
+      dropOnEmptyRight: "Sposta {panel} nella barra laterale destra vuota",
+      resize: "Ridimensiona {panel}",
     },
     thread: {
       search: "Cerca messaggi",

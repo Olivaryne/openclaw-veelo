@@ -581,7 +581,8 @@ export const th: TranslationMap = {
     worktreeNameInvalid: "ชื่อ worktree ใช้อักษรตัวพิมพ์เล็ก ตัวเลข และขีดกลาง",
     incognito: "ไม่ระบุตัวตน",
     incognitoDescription: "เก็บเธรดนี้ไว้จนกว่า Gateway จะรีสตาร์ทเท่านั้น",
-    startAsDraft: "เริ่มเป็นฉบับร่าง",
+    draft: "ฉบับร่าง",
+    draftDescription: "เก็บเธรดนี้ไว้เป็นส่วนตัวจนกว่าคุณจะเผยแพร่",
     messagePlaceholder: "เซสชันนี้ควรทำงานอะไร?",
     readingAttachment: "กำลังอ่านไฟล์แนบ",
     start: "เริ่มเซสชัน",
@@ -710,6 +711,7 @@ export const th: TranslationMap = {
     runErrorTimedOut: "หมดเวลา",
     runErrorUnknown: "ข้อผิดพลาดที่ไม่ทราบสาเหตุ",
     attentionRequired: "เซสชันต้องการความสนใจ",
+    openSession: "เปิดเธรด",
     model: "Model",
     provider: "Provider",
     runtime: "รันไทม์",
@@ -3143,13 +3145,17 @@ export const th: TranslationMap = {
       on: "เปิดการฝัน",
       off: "ปิดการฝัน",
     },
-    restartConfirmation: {
-      title: "รีสตาร์ท Gateway เพื่อใช้การเปลี่ยนแปลง",
-      subtitle: "การเปลี่ยนโหมด Dreaming จะรีสตาร์ท Gateway",
-      warning:
-        "การดำเนินการนี้จะรีสตาร์ท Gateway และอาจทำให้แชต ระบบอัตโนมัติ และช่องทางที่เชื่อมต่อหยุดชะงักชั่วคราว",
-      confirm: "ยืนยันการรีสตาร์ท",
-      restarting: "กำลังรีสตาร์ท…",
+    toggleConfirmation: {
+      subtitle: "Dreaming เป็นการตั้งค่าส่วนกลาง ไม่จำกัดเฉพาะเอเจนต์นี้",
+      enableTitle: "เปิด Dreaming สำหรับเอเจนต์ทั้งหมด",
+      enableDetail:
+        "การกวาด Dreaming ในตอนกลางคืนจะทำงานทั่วทุกพื้นที่ทำงานของเอเจนต์ที่กำหนดค่าไว้ โดยเลื่อนความจำระยะสั้นให้กลายเป็นความจำระยะยาว การนี้จะมีผลทันที",
+      enableConfirm: "เปิด Dreaming",
+      disableTitle: "ปิด Dreaming สำหรับเอเจนต์ทั้งหมด",
+      disableDetail:
+        "การกวาด Dreaming ในตอนกลางคืนจะหยุดสำหรับทุกเอเจนต์ที่กำหนดค่าไว้ ไม่ใช่แค่เอเจนต์นี้ ความจำที่เขียนไว้แล้วจะยังคงอยู่ แต่จะไม่มีการเลื่อนสิ่งใหม่ๆ การนี้จะมีผลทันที",
+      disableConfirm: "ปิด Dreaming",
+      saving: "กำลังบันทึก…",
       failed: "ไม่สามารถใช้การเปลี่ยนแปลงได้ ตรวจสอบการเชื่อมต่อของคุณแล้วลองอีกครั้ง",
     },
     status: {
@@ -3774,6 +3780,11 @@ export const th: TranslationMap = {
     },
     outputTokens: "{count} โทเค็นเอาต์พุต",
     archivedSessionDisabled: "กู้คืนเซสชันนี้เพื่อส่งข้อความ",
+    sessionRoute: {
+      chooseTitle: "เลือกเซสชัน",
+      multipleMatches: "มีเซสชันมากกว่าหนึ่งรายการที่ตรงกับ {shortId}",
+      additionalMatches: "ยังมีผลการค้นหาเหลืออยู่ ใช้คำนำหน้า id ที่ยาวขึ้น",
+    },
     sessionSharing: {
       menu: "การแชร์เธรด",
       current: "การมองเห็นเธรด: {visibility}",
@@ -3825,6 +3836,15 @@ export const th: TranslationMap = {
       oneMessage: "{count} ข้อความ",
       messages: "{count} ข้อความ",
       activeBranch: "branch ที่ใช้งานอยู่",
+      gatewayPicker: {
+        menuLabel: "Gateway: {gateway}",
+        primaryTag: "หลัก",
+        setPrimary: "ตั้งเป็นหลัก…",
+        openSettings: "การตั้งค่า Gateway…",
+        connected: "เชื่อมต่อแล้ว",
+        unreachable: "เข้าถึงไม่ได้",
+        unknown: "สถานะไม่ทราบ",
+      },
     },
     board: {
       faceLabel: "หน้า thread",
@@ -4014,7 +4034,9 @@ export const th: TranslationMap = {
       threads: "เธรด",
       groups: "กลุ่ม",
       coding: "การเขียนโค้ด",
-      groupCatalogSessionsByProject: "จัดกลุ่มตามโปรเจกต์",
+      catalogViewOptions: "ตัวเลือกมุมมอง",
+      catalogGroupByProject: "โปรเจกต์",
+      catalogGroupByPerson: "บุคคล",
       openSessionMenu: "Open session menu",
       sortBy: "จัดเรียงตาม",
       sortCreated: "สร้างเมื่อ",
@@ -4193,6 +4215,16 @@ export const th: TranslationMap = {
       renderedMarkdownHint: "ตัวอย่างข้อความแบบ Rich Text ที่ผ่านการกรองเพื่อการอ่านอย่างรวดเร็ว",
       noPreviewableMarkdown: "ไม่มีเนื้อหา markdown ที่แสดงตัวอย่างได้",
       noContent: "ไม่มีเนื้อหา",
+    },
+    sidebarColumns: {
+      chat: "แชท",
+      discussion: "การสนทนา",
+      detail: "รายละเอียด",
+      close: "ปิด {panel}",
+      drag: "ลาก {panel}",
+      dropOnEmptyLeft: "ย้าย {panel} ไปยังแถบด้านซ้ายที่ว่าง",
+      dropOnEmptyRight: "ย้าย {panel} ไปยังแถบด้านขวาที่ว่าง",
+      resize: "ปรับขนาด {panel}",
     },
     thread: {
       search: "ค้นหาข้อความ",

@@ -599,7 +599,8 @@ export const ru: TranslationMap = {
     worktreeNameInvalid: "Имена рабочих деревьев могут содержать строчные буквы, цифры и дефисы.",
     incognito: "Инкогнито",
     incognitoDescription: "Хранить эту цепочку только до перезапуска Gateway",
-    startAsDraft: "Начать как черновик",
+    draft: "Черновик",
+    draftDescription: "Держите эту ветку при себе, пока не опубликуете её",
     messagePlaceholder: "Над чем должна работать эта сессия?",
     readingAttachment: "Чтение вложения",
     start: "Начать сессию",
@@ -731,6 +732,7 @@ export const ru: TranslationMap = {
     runErrorTimedOut: "Время ожидания истекло",
     runErrorUnknown: "Неизвестная ошибка",
     attentionRequired: "Сессия требует внимания",
+    openSession: "Открыть ветку",
     model: "Модель",
     provider: "Поставщик",
     runtime: "Среда выполнения",
@@ -3219,13 +3221,17 @@ export const ru: TranslationMap = {
       on: "Dreaming включен",
       off: "Dreaming выключен",
     },
-    restartConfirmation: {
-      title: "Перезапустите Gateway, чтобы применить изменение",
-      subtitle: "Изменение режима Dreaming перезапускает gateway.",
-      warning:
-        "Это действие перезапустит Gateway и может временно прервать чаты, автоматизации и подключенные каналы.",
-      confirm: "Подтвердить перезапуск",
-      restarting: "Перезапуск…",
+    toggleConfirmation: {
+      subtitle: "Сон — это глобальная настройка; она не ограничивается этим агентом.",
+      enableTitle: "Включить сон для всех агентов",
+      enableDetail:
+        "Ночной проход сна будет выполняться по каждому настроенному рабочему пространству агента, переводя краткосрочные воспоминания в долгосрочную память. Это применяется сразу.",
+      enableConfirm: "Включить сон",
+      disableTitle: "Выключить сон для всех агентов",
+      disableDetail:
+        "Ночной проход сна остановится для всех настроенных агентов, а не только для этого. Уже записанные воспоминания сохранятся; ничего нового не будет переведено в долгосрочную память. Это применяется сразу.",
+      disableConfirm: "Выключить сон",
+      saving: "Сохранение…",
       failed: "Не удалось применить изменение. Проверьте подключение и повторите попытку.",
     },
     status: {
@@ -3885,6 +3891,11 @@ export const ru: TranslationMap = {
     },
     outputTokens: "{count} выходных токенов",
     archivedSessionDisabled: "Восстановите этот сеанс, чтобы отправлять сообщения.",
+    sessionRoute: {
+      chooseTitle: "Выберите сеанс",
+      multipleMatches: "Более одного сеанса соответствует {shortId}.",
+      additionalMatches: "Остаются результаты поиска. Используйте более длинный префикс id.",
+    },
     sessionSharing: {
       menu: "Совместный доступ к потоку",
       current: "Видимость потока: {visibility}",
@@ -3937,6 +3948,15 @@ export const ru: TranslationMap = {
       oneMessage: "{count} сообщение",
       messages: "{count} сообщений",
       activeBranch: "Активная ветка",
+      gatewayPicker: {
+        menuLabel: "Gateway: {gateway}",
+        primaryTag: "основной",
+        setPrimary: "Сделать основным…",
+        openSettings: "Настройки Gateway…",
+        connected: "Подключено",
+        unreachable: "Недоступно",
+        unknown: "Неизвестный статус",
+      },
     },
     board: {
       faceLabel: "Вид ветки",
@@ -4128,7 +4148,9 @@ export const ru: TranslationMap = {
       threads: "Треды",
       groups: "Группы",
       coding: "Программирование",
-      groupCatalogSessionsByProject: "Группировать по проекту",
+      catalogViewOptions: "Параметры отображения",
+      catalogGroupByProject: "Проект",
+      catalogGroupByPerson: "Человек",
       openSessionMenu: "Open session menu",
       sortBy: "Сортировать по",
       sortCreated: "Создано",
@@ -4307,6 +4329,16 @@ export const ru: TranslationMap = {
       renderedMarkdownHint: "Очищенный предпросмотр форматированного текста для быстрого чтения.",
       noPreviewableMarkdown: "Нет содержимого Markdown для предпросмотра.",
       noContent: "Содержимое недоступно",
+    },
+    sidebarColumns: {
+      chat: "Чат",
+      discussion: "Обсуждение",
+      detail: "Сведения",
+      close: "Закрыть {panel}",
+      drag: "Перетащить {panel}",
+      dropOnEmptyLeft: "Переместить {panel} на пустую левую боковую панель",
+      dropOnEmptyRight: "Переместить {panel} на пустую правую боковую панель",
+      resize: "Изменить размер {panel}",
     },
     thread: {
       search: "Поиск сообщений",

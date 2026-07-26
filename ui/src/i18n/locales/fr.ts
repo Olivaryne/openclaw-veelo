@@ -608,7 +608,8 @@ export const fr: TranslationMap = {
       "Les noms de worktree utilisent des lettres minuscules, des chiffres et des tirets.",
     incognito: "Navigation privée",
     incognitoDescription: "Conserver ce fil uniquement jusqu'au redémarrage du Gateway",
-    startAsDraft: "Démarrer comme brouillon",
+    draft: "Brouillon",
+    draftDescription: "Gardez ce fil pour vous jusqu'à ce que vous le publiiez",
     messagePlaceholder: "Sur quoi cette session doit-elle travailler ?",
     readingAttachment: "Lecture de la pièce jointe",
     start: "Démarrer la session",
@@ -741,6 +742,7 @@ export const fr: TranslationMap = {
     runErrorTimedOut: "Expiration du délai",
     runErrorUnknown: "Erreur inconnue",
     attentionRequired: "La session nécessite votre attention",
+    openSession: "Ouvrir le fil",
     model: "Modèle",
     provider: "Fournisseur",
     runtime: "Exécution",
@@ -3262,14 +3264,18 @@ export const fr: TranslationMap = {
       on: "Rêverie activée",
       off: "Rêverie désactivée",
     },
-    restartConfirmation: {
-      title: "Restart Gateway to Apply Change",
-      subtitle: "Changing Dreaming mode restarts the gateway.",
-      warning:
-        "This action will restart the Gateway and may temporarily interrupt chats, automations, and connected channels.",
-      confirm: "Confirm Restart",
-      restarting: "Restarting…",
-      failed: "Could not apply change. Check your connection and try again.",
+    toggleConfirmation: {
+      subtitle: "Le rêve est un paramètre global ; il n'est pas limité à cet agent.",
+      enableTitle: "Activer le rêve pour tous les agents",
+      enableDetail:
+        "Le balayage nocturne du rêve s'exécutera sur chaque espace de travail d'agent configuré, en promouvant les rappels à court terme vers la mémoire à long terme. Cela s'applique immédiatement.",
+      enableConfirm: "Activer le rêve",
+      disableTitle: "Désactiver le rêve pour tous les agents",
+      disableDetail:
+        "Le balayage nocturne du rêve s'arrêtera pour chaque agent configuré, pas seulement celui-ci. Les souvenirs déjà écrits restent ; rien de nouveau n'est promu. Cela s'applique immédiatement.",
+      disableConfirm: "Désactiver le rêve",
+      saving: "Enregistrement…",
+      failed: "Impossible d'appliquer la modification. Vérifiez votre connexion et réessayez.",
     },
     status: {
       active: "Rêverie active",
@@ -3934,6 +3940,12 @@ export const fr: TranslationMap = {
     },
     outputTokens: "{count} jetons de sortie",
     archivedSessionDisabled: "Restaurez cette session pour envoyer des messages.",
+    sessionRoute: {
+      chooseTitle: "Choisir une session",
+      multipleMatches: "Plusieurs sessions correspondent à {shortId}.",
+      additionalMatches:
+        "Des résultats de recherche subsistent. Utilisez un préfixe d'id plus long.",
+    },
     sessionSharing: {
       menu: "Partage de conversation",
       current: "Visibilité de la conversation : {visibility}",
@@ -3988,6 +4000,15 @@ export const fr: TranslationMap = {
       oneMessage: "{count} message",
       messages: "{count} messages",
       activeBranch: "Branche active",
+      gatewayPicker: {
+        menuLabel: "Gateway : {gateway}",
+        primaryTag: "principal",
+        setPrimary: "Définir comme principal…",
+        openSettings: "Paramètres de Gateway…",
+        connected: "Connecté",
+        unreachable: "Inaccessible",
+        unknown: "Statut inconnu",
+      },
     },
     board: {
       faceLabel: "Face du fil",
@@ -4180,7 +4201,9 @@ export const fr: TranslationMap = {
       threads: "Fils",
       groups: "Groupes",
       coding: "Codage",
-      groupCatalogSessionsByProject: "Grouper par projet",
+      catalogViewOptions: "Options d'affichage",
+      catalogGroupByProject: "Projet",
+      catalogGroupByPerson: "Personne",
       openSessionMenu: "Open session menu",
       sortBy: "Trier par",
       sortCreated: "Créé",
@@ -4359,6 +4382,16 @@ export const fr: TranslationMap = {
       renderedMarkdownHint: "Aperçu en texte enrichi nettoyé pour une lecture rapide.",
       noPreviewableMarkdown: "Aucun contenu markdown à prévisualiser.",
       noContent: "Aucun contenu disponible",
+    },
+    sidebarColumns: {
+      chat: "Discussion",
+      discussion: "Discussion",
+      detail: "Détails",
+      close: "Fermer {panel}",
+      drag: "Déplacer {panel}",
+      dropOnEmptyLeft: "Déplacer {panel} vers la barre latérale gauche vide",
+      dropOnEmptyRight: "Déplacer {panel} vers la barre latérale droite vide",
+      resize: "Redimensionner {panel}",
     },
     thread: {
       search: "Rechercher des messages",

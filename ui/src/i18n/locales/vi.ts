@@ -597,7 +597,8 @@ export const vi: TranslationMap = {
     worktreeNameInvalid: "Tên worktree dùng chữ cái viết thường, chữ số và dấu gạch nối.",
     incognito: "Ẩn danh",
     incognitoDescription: "Chỉ giữ chuỗi hội thoại này cho đến khi Gateway khởi động lại",
-    startAsDraft: "Bắt đầu ở dạng bản nháp",
+    draft: "Bản nháp",
+    draftDescription: "Giữ chuỗi tin này riêng tư cho đến khi bạn xuất bản",
     messagePlaceholder: "Phiên này nên làm việc gì?",
     readingAttachment: "Đang đọc tệp đính kèm",
     start: "Bắt đầu phiên",
@@ -728,6 +729,7 @@ export const vi: TranslationMap = {
     runErrorTimedOut: "Đã hết thời gian chờ",
     runErrorUnknown: "Lỗi không xác định",
     attentionRequired: "Phiên cần chú ý",
+    openSession: "Mở chuỗi tin",
     model: "Mô hình",
     provider: "Nhà cung cấp",
     runtime: "Runtime",
@@ -3201,13 +3203,17 @@ export const vi: TranslationMap = {
       on: "Đang bật Dreaming",
       off: "Đang tắt Dreaming",
     },
-    restartConfirmation: {
-      title: "Khởi động lại Gateway để áp dụng thay đổi",
-      subtitle: "Thay đổi chế độ Dreaming sẽ khởi động lại Gateway.",
-      warning:
-        "Hành động này sẽ khởi động lại Gateway và có thể tạm thời gián đoạn trò chuyện, tự động hóa và các kênh đã kết nối.",
-      confirm: "Xác nhận khởi động lại",
-      restarting: "Đang khởi động lại…",
+    toggleConfirmation: {
+      subtitle: "Dreaming là cài đặt toàn cục; nó không áp dụng riêng cho tác nhân này.",
+      enableTitle: "Bật Dreaming cho Tất cả Tác nhân",
+      enableDetail:
+        "Quá trình quét dreaming hằng đêm sẽ chạy trên mọi không gian làm việc tác nhân đã cấu hình, chuyển các hồi ức ngắn hạn thành bộ nhớ dài hạn. Điều này áp dụng ngay lập tức.",
+      enableConfirm: "Bật Dreaming",
+      disableTitle: "Tắt Dreaming cho Tất cả Tác nhân",
+      disableDetail:
+        "Quá trình quét dreaming hằng đêm sẽ dừng cho mọi tác nhân đã cấu hình, không chỉ riêng tác nhân này. Những bộ nhớ đã ghi vẫn được giữ; không có gì mới được chuyển lên. Điều này áp dụng ngay lập tức.",
+      disableConfirm: "Tắt Dreaming",
+      saving: "Đang lưu…",
       failed: "Không thể áp dụng thay đổi. Kiểm tra kết nối của bạn và thử lại.",
     },
     status: {
@@ -3851,6 +3857,11 @@ export const vi: TranslationMap = {
     },
     outputTokens: "{count} token đầu ra",
     archivedSessionDisabled: "Khôi phục phiên này để gửi tin nhắn.",
+    sessionRoute: {
+      chooseTitle: "Chọn một phiên",
+      multipleMatches: "Có nhiều hơn một phiên khớp với {shortId}.",
+      additionalMatches: "Vẫn còn kết quả tìm kiếm. Dùng tiền tố id dài hơn.",
+    },
     sessionSharing: {
       menu: "Chia sẻ luồng",
       current: "Hiển thị luồng: {visibility}",
@@ -3902,6 +3913,15 @@ export const vi: TranslationMap = {
       oneMessage: "{count} tin nhắn",
       messages: "{count} tin nhắn",
       activeBranch: "Nhánh đang hoạt động",
+      gatewayPicker: {
+        menuLabel: "Gateway: {gateway}",
+        primaryTag: "chính",
+        setPrimary: "Đặt làm chính…",
+        openSettings: "Cài đặt Gateway…",
+        connected: "Đã kết nối",
+        unreachable: "Không thể kết nối",
+        unknown: "Trạng thái không xác định",
+      },
     },
     board: {
       faceLabel: "Mặt luồng",
@@ -4093,7 +4113,9 @@ export const vi: TranslationMap = {
       threads: "Luồng",
       groups: "Nhóm",
       coding: "Lập trình",
-      groupCatalogSessionsByProject: "Nhóm theo dự án",
+      catalogViewOptions: "Tùy chọn hiển thị",
+      catalogGroupByProject: "Dự án",
+      catalogGroupByPerson: "Người",
       openSessionMenu: "Open session menu",
       sortBy: "Sắp xếp theo",
       sortCreated: "Đã tạo",
@@ -4272,6 +4294,16 @@ export const vi: TranslationMap = {
       renderedMarkdownHint: "Bản xem trước văn bản đa dạng thức đã lọc để đọc nhanh.",
       noPreviewableMarkdown: "Không có nội dung markdown có thể xem trước.",
       noContent: "Không có nội dung khả dụng",
+    },
+    sidebarColumns: {
+      chat: "Trò chuyện",
+      discussion: "Thảo luận",
+      detail: "Chi tiết",
+      close: "Đóng {panel}",
+      drag: "Kéo {panel}",
+      dropOnEmptyLeft: "Di chuyển {panel} sang thanh bên trái trống",
+      dropOnEmptyRight: "Di chuyển {panel} sang thanh bên phải trống",
+      resize: "Đổi kích thước {panel}",
     },
     thread: {
       search: "Tìm kiếm tin nhắn",

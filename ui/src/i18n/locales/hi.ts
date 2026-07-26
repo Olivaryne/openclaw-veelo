@@ -590,7 +590,8 @@ export const hi: TranslationMap = {
     worktreeNameInvalid: "Worktree names में lowercase letters, digits, और dashes का उपयोग होता है।",
     incognito: "गुप्त",
     incognitoDescription: "इस थ्रेड को केवल तब तक रखें जब तक Gateway पुनः आरंभ न हो जाए",
-    startAsDraft: "ड्राफ़्ट के रूप में शुरू करें",
+    draft: "ड्राफ़्ट",
+    draftDescription: "इस थ्रेड को प्रकाशित करने तक अपने पास ही रखें",
     messagePlaceholder: "यह session किस पर काम करे?",
     readingAttachment: "अटैचमेंट पढ़ रहे हैं",
     start: "Session शुरू करें",
@@ -721,6 +722,7 @@ export const hi: TranslationMap = {
     runErrorTimedOut: "समय समाप्त",
     runErrorUnknown: "अज्ञात त्रुटि",
     attentionRequired: "सत्र पर ध्यान देना आवश्यक है",
+    openSession: "थ्रेड खोलें",
     model: "मॉडल",
     provider: "प्रदाता",
     runtime: "रनटाइम",
@@ -3160,13 +3162,17 @@ export const hi: TranslationMap = {
       on: "Dreaming चालू",
       off: "Dreaming बंद",
     },
-    restartConfirmation: {
-      title: "परिवर्तन लागू करने के लिए Gateway पुनः आरंभ करें",
-      subtitle: "Dreaming मोड बदलने से gateway पुनः आरंभ होता है।",
-      warning:
-        "यह कार्रवाई Gateway को पुनः आरंभ करेगी और चैट, ऑटोमेशन, और कनेक्टेड चैनलों को अस्थायी रूप से बाधित कर सकती है।",
-      confirm: "पुनः आरंभ की पुष्टि करें",
-      restarting: "पुनः आरंभ हो रहा है…",
+    toggleConfirmation: {
+      subtitle: "Dreaming एक वैश्विक सेटिंग है; यह इस एजेंट तक सीमित नहीं है।",
+      enableTitle: "सभी एजेंटों के लिए Dreaming चालू करें",
+      enableDetail:
+        "रात्रिकालीन dreaming स्वीप हर कॉन्फ़िगर किए गए एजेंट वर्कस्पेस में चलेगी, अल्पकालिक स्मृतियों को दीर्घकालिक स्मृति में बढ़ावा देगी। यह तुरंत लागू होता है।",
+      enableConfirm: "Dreaming चालू करें",
+      disableTitle: "सभी एजेंटों के लिए Dreaming बंद करें",
+      disableDetail:
+        "रात्रिकालीन dreaming स्वीप केवल इसी नहीं बल्कि हर कॉन्फ़िगर किए गए एजेंट के लिए रुक जाएगी। पहले से लिखी गई स्मृतियाँ बनी रहती हैं; कुछ नया बढ़ावा नहीं मिलता। यह तुरंत लागू होता है।",
+      disableConfirm: "Dreaming बंद करें",
+      saving: "सहेजा जा रहा है…",
       failed: "परिवर्तन लागू नहीं किया जा सका। अपना कनेक्शन जांचें और फिर से प्रयास करें।",
     },
     status: {
@@ -3804,6 +3810,11 @@ export const hi: TranslationMap = {
     },
     outputTokens: "{count} आउटपुट टोकन",
     archivedSessionDisabled: "संदेश भेजने के लिए इस सत्र को बहाल करें।",
+    sessionRoute: {
+      chooseTitle: "एक सत्र चुनें",
+      multipleMatches: "एक से अधिक सत्र {shortId} से मेल खाते हैं।",
+      additionalMatches: "खोज परिणाम शेष हैं। लंबे id उपसर्ग का उपयोग करें।",
+    },
     sessionSharing: {
       menu: "थ्रेड साझाकरण",
       current: "थ्रेड दृश्यता: {visibility}",
@@ -3855,6 +3866,15 @@ export const hi: TranslationMap = {
       oneMessage: "{count} संदेश",
       messages: "{count} संदेश",
       activeBranch: "सक्रिय शाखा",
+      gatewayPicker: {
+        menuLabel: "Gateway: {gateway}",
+        primaryTag: "प्राथमिक",
+        setPrimary: "प्राथमिक के रूप में सेट करें…",
+        openSettings: "Gateway सेटिंग्स…",
+        connected: "कनेक्टेड",
+        unreachable: "पहुँच से बाहर",
+        unknown: "अज्ञात स्थिति",
+      },
     },
     board: {
       faceLabel: "थ्रेड फेस",
@@ -4044,7 +4064,9 @@ export const hi: TranslationMap = {
       threads: "थ्रेड",
       groups: "समूह",
       coding: "कोडिंग",
-      groupCatalogSessionsByProject: "प्रोजेक्ट के अनुसार समूहित करें",
+      catalogViewOptions: "व्यू विकल्प",
+      catalogGroupByProject: "प्रोजेक्ट",
+      catalogGroupByPerson: "व्यक्ति",
       openSessionMenu: "Open session menu",
       sortBy: "इसके अनुसार क्रमबद्ध करें",
       sortCreated: "बनाया गया",
@@ -4223,6 +4245,16 @@ export const hi: TranslationMap = {
       renderedMarkdownHint: "त्वरित पढ़ने के लिए सैनिटाइज़ किया गया रिच-टेक्स्ट पूर्वावलोकन।",
       noPreviewableMarkdown: "कोई पूर्वावलोकन योग्य markdown सामग्री नहीं।",
       noContent: "कोई सामग्री उपलब्ध नहीं",
+    },
+    sidebarColumns: {
+      chat: "चैट",
+      discussion: "चर्चा",
+      detail: "विवरण",
+      close: "{panel} बंद करें",
+      drag: "{panel} खींचें",
+      dropOnEmptyLeft: "{panel} को खाली बाएँ साइडबार में ले जाएँ",
+      dropOnEmptyRight: "{panel} को खाली दाएँ साइडबार में ले जाएँ",
+      resize: "{panel} का आकार बदलें",
     },
     thread: {
       search: "संदेश खोजें",

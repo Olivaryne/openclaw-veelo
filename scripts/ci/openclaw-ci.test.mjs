@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { gzipSync } from "node:zlib";
 import {
+  extractPackageTree,
+  inspectPackageArchive,
   readParentAttestation,
   scanLinesForDisclosure,
   validateGovernedScope,
@@ -16,6 +19,7 @@ import {
   validateWorkflowText,
   verifyContractReferences,
   verifyExactHead,
+  verifyExtractedTree,
   writeReceiptArtifacts,
 } from "./openclaw-ci.mjs";
 
@@ -881,6 +885,352 @@ test("secret-shaped receipt values are rejected", () => {
   const value = validReceipt();
   value.workflow_name = ["ghp", "_", "a".repeat(26)].join("");
   assert.throws(() => validateReceipt(value, manifest), /secret-shaped/);
+});
+
+// Synthetic ustar builder for hermetic rollback-package archive tests. Raw
+// header bytes let negative cases cover entry types (devices, FIFOs, links)
+// that no unprivileged system tar invocation could create.
+function tarBlock(name, { type = "0", content = "", linkname = "" } = {}) {
+  const body = Buffer.from(content, "utf8");
+  const header = Buffer.alloc(512);
+  assert.ok(name.length <= 100, "fixture entry names stay within the plain ustar name field");
+  header.write(name, 0, "utf8");
+  header.write("0000644\0", 100, "ascii");
+  header.write("0000000\0", 108, "ascii");
+  header.write("0000000\0", 116, "ascii");
+  header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124, "ascii");
+  header.write("00000000000\0", 136, "ascii");
+  header.write("        ", 148, "ascii");
+  header.write(type, 156, "ascii");
+  header.write(linkname, 157, "utf8");
+  header.write("ustar\0", 257, "ascii");
+  header.write("00", 263, "ascii");
+  let sum = 0;
+  for (const byte of header) {
+    sum += byte;
+  }
+  header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+  const paddedBody = Buffer.alloc(Math.ceil(body.length / 512) * 512);
+  body.copy(paddedBody);
+  return Buffer.concat([header, paddedBody]);
+}
+
+function makeTarball(entries) {
+  const blocks = entries.map(([name, options]) => tarBlock(name, options));
+  return gzipSync(Buffer.concat([...blocks, Buffer.alloc(1024)]));
+}
+
+const FIXTURE_BUNDLE_ENTRY = "package/dist/sqlite-store-fixture.js";
+const FIXTURE_BUNDLE_SOURCE =
+  'import { marker } from "./paths-fixture.js";\nconsole.log(`fixture-bundle:${marker}`);\n';
+
+function fixturePackageEntries() {
+  return [
+    [
+      "package/package.json",
+      { content: '{"name":"openclaw-rollback-fixture","version":"0.0.0","type":"module"}\n' },
+    ],
+    [FIXTURE_BUNDLE_ENTRY, { content: FIXTURE_BUNDLE_SOURCE }],
+    [
+      "package/dist/paths-fixture.js",
+      { content: 'export const marker = "paths-module-staged";\n' },
+    ],
+    ["package/dist/nested/asset.txt", { content: "nested-regular-asset\n" }],
+  ];
+}
+
+function importBundleInChild(bundleFile) {
+  return spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `await import(${JSON.stringify(pathToFileURL(bundleFile).href)});`,
+    ],
+    { encoding: "utf8" },
+  );
+}
+
+function makeExtractionDir(prefix) {
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+}
+
+test("single-file staging of the fixture bundle reproduces ERR_MODULE_NOT_FOUND", () => {
+  // The previous extraction model staged only the selected bundle file; a
+  // child Node import must fail exactly like the governed canary did.
+  const dir = makeExtractionDir("openclaw-singlefile-");
+  try {
+    fs.mkdirSync(path.join(dir, "package/dist"), { recursive: true });
+    const bundleFile = path.join(dir, FIXTURE_BUNDLE_ENTRY);
+    fs.writeFileSync(bundleFile, FIXTURE_BUNDLE_SOURCE);
+    const result = importBundleInChild(bundleFile);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /ERR_MODULE_NOT_FOUND/);
+    assert.match(result.stderr, /paths-fixture\.js/);
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
+});
+
+test("complete-package extraction lets a child process import the selected bundle", () => {
+  const dir = makeExtractionDir("openclaw-fulltree-");
+  try {
+    const staged = extractPackageTree(makeTarball(fixturePackageEntries()), dir);
+    assert.equal(staged.bundleEntry, FIXTURE_BUNDLE_ENTRY);
+    assert.ok(
+      staged.bundlePath.startsWith(`${dir}${path.sep}`),
+      "bundle path must stay inside the extraction root",
+    );
+    const result = importBundleInChild(staged.bundlePath);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /fixture-bundle:paths-module-staged/);
+    assert.ok(fs.lstatSync(path.join(dir, "package/package.json")).isFile());
+    assert.equal(
+      fs.readFileSync(path.join(dir, "package/dist/nested/asset.txt"), "utf8"),
+      "nested-regular-asset\n",
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
+});
+
+test("archive inspection selects exactly one bundle and lists the complete tree", () => {
+  const { entries, bundleEntry } = inspectPackageArchive(makeTarball(fixturePackageEntries()));
+  assert.equal(bundleEntry, FIXTURE_BUNDLE_ENTRY);
+  const byPath = (left, right) => (left < right ? -1 : left > right ? 1 : 0);
+  assert.deepEqual(
+    entries.map((entry) => entry.path).toSorted(byPath),
+    [
+      "package/dist/nested/asset.txt",
+      "package/dist/paths-fixture.js",
+      FIXTURE_BUNDLE_ENTRY,
+      "package/package.json",
+    ].toSorted(byPath),
+  );
+});
+
+test("explicit directory entries are staged alongside files", () => {
+  const dir = makeExtractionDir("openclaw-dirent-");
+  try {
+    const staged = extractPackageTree(
+      makeTarball([
+        ["package/", { type: "5" }],
+        ["package/dist/", { type: "5" }],
+        ...fixturePackageEntries(),
+      ]),
+      dir,
+    );
+    assert.ok(fs.lstatSync(staged.bundlePath).isFile());
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
+});
+
+const maliciousArchiveCases = [
+  [
+    "zero SQLite bundles",
+    () => fixturePackageEntries().filter(([name]) => name !== FIXTURE_BUNDLE_ENTRY),
+    /expected exactly one packaged SQLite store bundle, found 0/,
+  ],
+  [
+    "two SQLite bundles",
+    () => [
+      ...fixturePackageEntries(),
+      ["package/dist/sqlite-store-second.js", { content: "export {};\n" }],
+    ],
+    /expected exactly one packaged SQLite store bundle, found 2/,
+  ],
+  [
+    "bundle-named file outside package/dist",
+    () =>
+      fixturePackageEntries().map(([name, options]) =>
+        name === FIXTURE_BUNDLE_ENTRY
+          ? ["package/lib/sqlite-store-fixture.js", options]
+          : [name, options],
+      ),
+    /expected exactly one packaged SQLite store bundle, found 0/,
+  ],
+  [
+    "missing package metadata",
+    () => fixturePackageEntries().filter(([name]) => name !== "package/package.json"),
+    /missing package\/package\.json/,
+  ],
+  [
+    "absolute path",
+    () => [...fixturePackageEntries(), ["/package/evil.js", { content: "evil\n" }]],
+    /unsafe archive path/,
+  ],
+  [
+    "dot-dot traversal",
+    () => [...fixturePackageEntries(), ["package/../evil.js", { content: "evil\n" }]],
+    /unsafe archive path/,
+  ],
+  [
+    "entry outside the top-level package directory",
+    () => [...fixturePackageEntries(), ["other/evil.js", { content: "evil\n" }]],
+    /escapes the top-level package directory/,
+  ],
+  [
+    "symbolic link entry",
+    () => [
+      ...fixturePackageEntries(),
+      ["package/dist/evil-link.js", { type: "2", linkname: "/etc/passwd" }],
+    ],
+    /prohibited symbolic link entry/,
+  ],
+  [
+    "selected bundle as a symlink",
+    () => [
+      ...fixturePackageEntries().filter(([name]) => name !== FIXTURE_BUNDLE_ENTRY),
+      [FIXTURE_BUNDLE_ENTRY, { type: "2", linkname: "./paths-fixture.js" }],
+    ],
+    /prohibited symbolic link entry/,
+  ],
+  [
+    "hard link entry",
+    () => [
+      ...fixturePackageEntries(),
+      ["package/dist/evil-hardlink.js", { type: "1", linkname: "package/package.json" }],
+    ],
+    /prohibited hard link entry/,
+  ],
+  [
+    "FIFO entry",
+    () => [...fixturePackageEntries(), ["package/fifo", { type: "6" }]],
+    /prohibited FIFO entry/,
+  ],
+  [
+    "character device entry",
+    () => [...fixturePackageEntries(), ["package/dev-char", { type: "3" }]],
+    /prohibited device entry/,
+  ],
+  [
+    "block device entry",
+    () => [...fixturePackageEntries(), ["package/dev-block", { type: "4" }]],
+    /prohibited device entry/,
+  ],
+  [
+    "pax extended header entry",
+    () => [
+      ["package/pax-meta", { type: "x", content: "30 path=package/dist/evil.js\n" }],
+      ...fixturePackageEntries(),
+    ],
+    /unsupported archive entry type/,
+  ],
+  [
+    "unknown entry type",
+    () => [...fixturePackageEntries(), ["package/strange", { type: "Z" }]],
+    /unsupported archive entry type/,
+  ],
+  [
+    "duplicate path",
+    () => [
+      ...fixturePackageEntries(),
+      ["package/dist/paths-fixture.js", { content: "export const marker = 0;\n" }],
+    ],
+    /duplicate or conflicting archive path/,
+  ],
+  [
+    "file/parent collision",
+    () => [
+      ["package/package.json", { content: "{}\n" }],
+      ["package/dist", { content: "file-where-directory-belongs\n" }],
+      [FIXTURE_BUNDLE_ENTRY, { content: FIXTURE_BUNDLE_SOURCE }],
+    ],
+    /file\/parent path collision/,
+  ],
+];
+
+for (const [name, buildEntries, expected] of maliciousArchiveCases) {
+  test(`rollback archive with ${String(name)} is refused`, () => {
+    assert.throws(() => inspectPackageArchive(makeTarball(buildEntries())), expected);
+  });
+}
+
+test("truncated rollback archive fails closed", () => {
+  const block = tarBlock("package/package.json", { content: "x".repeat(100) });
+  assert.throws(
+    () => inspectPackageArchive(gzipSync(block.subarray(0, 512))),
+    /archive is truncated/,
+  );
+});
+
+test("missing imported sibling in the synthetic package is refused at staging time", () => {
+  const dir = makeExtractionDir("openclaw-nosibling-");
+  try {
+    const entries = fixturePackageEntries().filter(
+      ([name]) => name !== "package/dist/paths-fixture.js",
+    );
+    assert.throws(
+      () => extractPackageTree(makeTarball(entries), dir),
+      /relative import is not staged: \.\/paths-fixture\.js/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
+});
+
+function stageExtractedFixtureTree() {
+  const dir = makeExtractionDir("openclaw-extracted-");
+  fs.mkdirSync(path.join(dir, "package/dist"), { recursive: true });
+  const bundleFile = path.join(dir, FIXTURE_BUNDLE_ENTRY);
+  fs.writeFileSync(bundleFile, "export {};\n");
+  return { dir, bundleFile };
+}
+
+test("post-extraction symlink in the staged tree is refused", () => {
+  const { dir, bundleFile } = stageExtractedFixtureTree();
+  try {
+    fs.symlinkSync("/etc/passwd", path.join(dir, "package/dist/evil-link.js"));
+    assert.throws(() => verifyExtractedTree(dir, bundleFile), /symbolic link/);
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
+});
+
+test("post-extraction non-regular object is refused where supported", () => {
+  const { dir, bundleFile } = stageExtractedFixtureTree();
+  try {
+    let fifoMade = false;
+    try {
+      execFileSync("mkfifo", [path.join(dir, "package/dist/fifo")]);
+      fifoMade = true;
+    } catch {
+      // platform without mkfifo: case is exercised on supported platforms only
+    }
+    if (fifoMade) {
+      assert.throws(() => verifyExtractedTree(dir, bundleFile), /non-regular object/);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
+});
+
+test("extracted bundle outside package/dist is refused", () => {
+  const { dir } = stageExtractedFixtureTree();
+  try {
+    fs.mkdirSync(path.join(dir, "package/lib"), { recursive: true });
+    const strayBundle = path.join(dir, "package/lib/sqlite-store-stray.js");
+    fs.writeFileSync(strayBundle, "export {};\n");
+    assert.throws(() => verifyExtractedTree(dir, strayBundle), /inside package\/dist/);
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
+});
+
+test("missing or non-regular selected bundle is refused", () => {
+  const { dir } = stageExtractedFixtureTree();
+  try {
+    assert.throws(
+      () => verifyExtractedTree(dir, path.join(dir, "package/dist/sqlite-store-absent.js")),
+      /missing from the extracted tree/,
+    );
+    const dirBundle = path.join(dir, "package/dist/sqlite-store-dir.js");
+    fs.mkdirSync(dirBundle);
+    assert.throws(() => verifyExtractedTree(dir, dirBundle), /regular file/);
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
 });
 
 test("bounded test outputs contain no secret-shaped fixture values", () => {

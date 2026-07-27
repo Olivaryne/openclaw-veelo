@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -957,23 +958,276 @@ function appendGitHubOutput(file, values) {
   fs.appendFileSync(file, `${lines.join("\n")}\n`, { encoding: "utf8" });
 }
 
-function extractTarEntry(archive, entry, outputDir) {
-  const detail = execFileSync("tar", ["-tvzf", archive, entry], {
-    encoding: "utf8",
-    maxBuffer: 4 * 1024 * 1024,
-  }).trim();
-  if (!detail.startsWith("-")) {
-    fail("rollback SQLite bundle must be a regular file");
+// The selected bundle carries relative imports to sibling package files, so
+// the complete package runtime tree must be staged, not one file. Extraction
+// is pure in-process parsing of the exact integrity-verified tarball bytes:
+// no tar subprocess, no symlink following, no lifecycle scripts.
+const PACKAGE_BUNDLE_RE = /^package\/dist\/sqlite-store-[A-Za-z0-9_-]+\.js$/;
+const MAX_EXTRACTED_ARCHIVE_BYTES = 512 * 1024 * 1024;
+const TAR_BLOCK = 512;
+
+function gunzipPackageArchive(tarball) {
+  try {
+    return gunzipSync(tarball, { maxOutputLength: MAX_EXTRACTED_ARCHIVE_BYTES });
+  } catch (error) {
+    return fail(`rollback package archive failed to decompress safely: ${error.message}`);
   }
-  execFileSync("tar", ["-xzf", archive, "-C", outputDir, entry], {
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  const resolvedRoot = fs.realpathSync(outputDir);
-  const extracted = fs.realpathSync(path.join(outputDir, entry));
-  if (!extracted.startsWith(`${resolvedRoot}${path.sep}`) || !fs.statSync(extracted).isFile()) {
-    fail("rollback bundle escaped extraction root");
+}
+
+function tarString(block, start, length) {
+  const raw = block.subarray(start, start + length);
+  const end = raw.indexOf(0);
+  return raw.subarray(0, end < 0 ? raw.length : end).toString("utf8");
+}
+
+function tarNumber(block, start, length, label) {
+  const raw = block.subarray(start, start + length);
+  if (raw.length > 0 && (raw[0] & 0x80) !== 0) {
+    fail(`${label} uses an unsupported binary tar encoding`);
   }
-  return extracted;
+  const text = tarString(block, start, length).trim();
+  if (!/^[0-7]*$/.test(text)) {
+    fail(`${label} is not a valid octal tar field`);
+  }
+  return text.length === 0 ? 0 : Number.parseInt(text, 8);
+}
+
+function assertTarHeaderChecksum(block) {
+  const expected = tarNumber(block, 148, 8, "tar header checksum");
+  let sum = 0;
+  for (let index = 0; index < TAR_BLOCK; index += 1) {
+    sum += index >= 148 && index < 156 ? 0x20 : block[index];
+  }
+  if (sum !== expected) {
+    fail("rollback package archive entry has an invalid header checksum");
+  }
+}
+
+function assertSafeArchiveEntryPath(name) {
+  if (
+    name.length === 0 ||
+    name.includes("\\") ||
+    name.includes("\0") ||
+    path.posix.isAbsolute(name)
+  ) {
+    fail(`rollback package contains an unsafe archive path: ${name}`);
+  }
+  const normalized = name.endsWith("/") ? name.slice(0, -1) : name;
+  const segments = normalized.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    fail(`rollback package contains an unsafe archive path: ${name}`);
+  }
+  if (normalized !== "package" && !normalized.startsWith("package/")) {
+    fail(`rollback package entry escapes the top-level package directory: ${name}`);
+  }
+  return normalized;
+}
+
+function assertSupportedEntryType(typeFlag, entryPath) {
+  if (typeFlag === "1") {
+    fail(`rollback package contains a prohibited hard link entry: ${entryPath}`);
+  }
+  if (typeFlag === "2") {
+    fail(`rollback package contains a prohibited symbolic link entry: ${entryPath}`);
+  }
+  if (typeFlag === "3" || typeFlag === "4") {
+    fail(`rollback package contains a prohibited device entry: ${entryPath}`);
+  }
+  if (typeFlag === "6") {
+    fail(`rollback package contains a prohibited FIFO entry: ${entryPath}`);
+  }
+  if (typeFlag !== "0" && typeFlag !== "5") {
+    fail(`rollback package contains an unsupported archive entry type "${typeFlag}": ${entryPath}`);
+  }
+}
+
+function parsePackageArchive(data) {
+  const filePaths = new Set();
+  const directoryPaths = new Set();
+  const explicitDirectoryPaths = new Set();
+  const entries = [];
+  const bundles = [];
+  // Duplicate/conflict ledger: a path may appear once, a file may never be
+  // reused as a parent directory, and implicit parents of every entry are
+  // tracked so file/parent collisions fail in either archive order.
+  const recordTreePath = (entryPath, kind) => {
+    if (
+      filePaths.has(entryPath) ||
+      (kind === "file" && directoryPaths.has(entryPath)) ||
+      (kind === "directory" && explicitDirectoryPaths.has(entryPath))
+    ) {
+      fail(`rollback package contains a duplicate or conflicting archive path: ${entryPath}`);
+    }
+    const segments = entryPath.split("/");
+    for (let depth = 1; depth < segments.length; depth += 1) {
+      const ancestor = segments.slice(0, depth).join("/");
+      if (filePaths.has(ancestor)) {
+        fail(`rollback package contains a file/parent path collision: ${entryPath}`);
+      }
+      directoryPaths.add(ancestor);
+    }
+    if (kind === "file") {
+      filePaths.add(entryPath);
+    } else {
+      explicitDirectoryPaths.add(entryPath);
+      directoryPaths.add(entryPath);
+    }
+  };
+  let offset = 0;
+  while (true) {
+    if (offset + TAR_BLOCK > data.length) {
+      fail("rollback package archive is truncated");
+    }
+    const block = data.subarray(offset, offset + TAR_BLOCK);
+    if (block.every((byte) => byte === 0)) {
+      if (!data.subarray(offset).every((byte) => byte === 0)) {
+        fail("rollback package archive has data after its end-of-archive marker");
+      }
+      break;
+    }
+    assertTarHeaderChecksum(block);
+    if (tarString(block, 257, 6) !== "ustar") {
+      fail("rollback package archive entry is not ustar-formatted");
+    }
+    const nameField = tarString(block, 0, 100);
+    const prefixField = tarString(block, 345, 155);
+    const rawName = prefixField.length > 0 ? `${prefixField}/${nameField}` : nameField;
+    const size = tarNumber(block, 124, 12, `archive entry size for ${rawName}`);
+    const typeFlag = block[156] === 0 ? "0" : String.fromCharCode(block[156]);
+    offset += TAR_BLOCK;
+    const dataEnd = offset + Math.ceil(size / TAR_BLOCK) * TAR_BLOCK;
+    if (dataEnd > data.length) {
+      fail("rollback package archive is truncated");
+    }
+    const entryPath = assertSafeArchiveEntryPath(rawName);
+    assertSupportedEntryType(typeFlag, entryPath);
+    const kind = typeFlag === "5" ? "directory" : "file";
+    recordTreePath(entryPath, kind);
+    if (kind === "file" && PACKAGE_BUNDLE_RE.test(entryPath)) {
+      bundles.push(entryPath);
+    }
+    entries.push({ path: entryPath, kind, start: offset, size });
+    offset = dataEnd;
+  }
+  if (bundles.length !== 1) {
+    fail(`expected exactly one packaged SQLite store bundle, found ${bundles.length}`);
+  }
+  if (!filePaths.has("package/package.json")) {
+    fail("rollback package is missing package/package.json");
+  }
+  return { entries, bundleEntry: bundles[0] };
+}
+
+export function inspectPackageArchive(tarball) {
+  return parsePackageArchive(gunzipPackageArchive(tarball));
+}
+
+export function verifyExtractedTree(rootDir, bundlePath) {
+  const resolvedRoot = fs.realpathSync(rootDir);
+  const walk = (dir) => {
+    for (const name of fs.readdirSync(dir).toSorted()) {
+      const child = path.join(dir, name);
+      const stats = fs.lstatSync(child);
+      if (stats.isSymbolicLink()) {
+        fail(`extracted rollback tree contains a symbolic link: ${name}`);
+      }
+      if (!stats.isDirectory() && !stats.isFile()) {
+        fail(`extracted rollback tree contains a non-regular object: ${name}`);
+      }
+      if (!fs.realpathSync(child).startsWith(`${resolvedRoot}${path.sep}`)) {
+        fail(`extracted rollback path escapes the extraction root: ${name}`);
+      }
+      if (stats.isDirectory()) {
+        walk(child);
+      }
+    }
+  };
+  walk(resolvedRoot);
+  let bundleStats;
+  try {
+    bundleStats = fs.lstatSync(bundlePath);
+  } catch {
+    fail("rollback bundle is missing from the extracted tree");
+  }
+  if (!bundleStats.isFile()) {
+    fail("rollback bundle must be a regular file");
+  }
+  // The symlink-free walk means realpath equals the literal path, so the
+  // resolved bundle must sit directly inside <root>/package/dist.
+  const expectedDist = path.join(resolvedRoot, "package", "dist");
+  let resolvedBundle;
+  let resolvedDist;
+  try {
+    resolvedBundle = fs.realpathSync(bundlePath);
+    resolvedDist = fs.realpathSync(expectedDist);
+  } catch {
+    fail("rollback bundle must resolve inside package/dist");
+  }
+  if (resolvedDist !== expectedDist || path.dirname(resolvedBundle) !== expectedDist) {
+    fail("rollback bundle must resolve inside package/dist");
+  }
+}
+
+const RELATIVE_IMPORT_PATTERNS = [
+  /\bfrom\s*["'](\.{1,2}\/[^"'\n]+)["']/g,
+  /\bimport\s*\(\s*["'](\.{1,2}\/[^"'\n]+)["']\s*\)/g,
+  /\bimport\s*["'](\.{1,2}\/[^"'\n]+)["']/g,
+  /\brequire\s*\(\s*["'](\.{1,2}\/[^"'\n]+)["']\s*\)/g,
+];
+
+// Bounded closure proof: every package-relative import of the selected bundle
+// must exist as a staged regular file. The mandatory rollback fixture stays
+// the authoritative behavior proof; this only guarantees the staged tree was
+// not reduced back to a single bundle file.
+function assertBundleImportClosure(rootDir, bundlePath) {
+  const resolvedRoot = fs.realpathSync(rootDir);
+  const source = fs.readFileSync(bundlePath, "utf8");
+  const specifiers = new Set();
+  for (const pattern of RELATIVE_IMPORT_PATTERNS) {
+    for (const match of source.matchAll(pattern)) {
+      specifiers.add(match[1]);
+    }
+  }
+  const bySpecifier = (left, right) => (left < right ? -1 : left > right ? 1 : 0);
+  for (const specifier of [...specifiers].toSorted(bySpecifier)) {
+    const resolved = path.resolve(path.dirname(bundlePath), specifier);
+    if (!resolved.startsWith(`${resolvedRoot}${path.sep}`)) {
+      fail(`rollback bundle relative import escapes the extraction root: ${specifier}`);
+    }
+    let stats;
+    try {
+      stats = fs.lstatSync(resolved);
+    } catch {
+      stats = null;
+    }
+    if (!stats?.isFile()) {
+      fail(`rollback bundle relative import is not staged: ${specifier}`);
+    }
+  }
+}
+
+export function extractPackageTree(tarball, destinationDir) {
+  const data = gunzipPackageArchive(tarball);
+  const { entries, bundleEntry } = parsePackageArchive(data);
+  const resolvedRoot = fs.realpathSync(destinationDir);
+  for (const entry of entries) {
+    const target = path.join(resolvedRoot, ...entry.path.split("/"));
+    if (entry.kind === "directory") {
+      fs.mkdirSync(target, { recursive: true });
+      continue;
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    // wx: parse-time duplicate checks make an existing target impossible;
+    // fail closed instead of overwriting if that invariant ever breaks.
+    fs.writeFileSync(target, data.subarray(entry.start, entry.start + entry.size), {
+      flag: "wx",
+      mode: 0o644,
+    });
+  }
+  const bundlePath = path.join(resolvedRoot, ...bundleEntry.split("/"));
+  verifyExtractedTree(resolvedRoot, bundlePath);
+  assertBundleImportClosure(resolvedRoot, bundlePath);
+  return { bundleEntry, bundlePath };
 }
 
 export function prepareRollbackPackage(manifest, outputDir, githubOutput) {
@@ -1012,31 +1266,17 @@ export function prepareRollbackPackage(manifest, outputDir, githubOutput) {
     fail("downloaded rollback package does not match registry integrity");
   }
   const artifactDigest = `sha256:${sha256Bytes(bytes)}`;
-  const entries = execFileSync("tar", ["-tzf", archive], {
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-  })
-    .split("\n")
-    .filter(Boolean);
-  for (const entry of entries) {
-    if (path.posix.isAbsolute(entry) || entry.split("/").includes("..")) {
-      fail("rollback package contains an unsafe archive path");
-    }
-  }
-  const bundles = entries.filter((entry) =>
-    /^package\/dist\/sqlite-store-[A-Za-z0-9_-]+\.js$/.test(entry),
-  );
-  if (bundles.length !== 1) {
-    fail(`expected exactly one packaged SQLite store bundle, found ${bundles.length}`);
-  }
-  const extractedRoot = fs.mkdtempSync(path.join(outputDir, "bundle-"));
-  const bundlePath = extractTarEntry(archive, bundles[0], extractedRoot);
+  // Stage the complete package runtime tree from the verified bytes: the
+  // selected bundle imports sibling dist modules, so single-file staging
+  // breaks the mandatory rollback fixture with ERR_MODULE_NOT_FOUND.
+  const extractedRoot = fs.mkdtempSync(path.join(outputDir, "package-"));
+  const staged = extractPackageTree(bytes, extractedRoot);
   const proof = {
     package_version: metadata.version,
     registry_integrity: metadata["dist.integrity"],
     artifact_digest: artifactDigest,
-    bundle_entry: bundles[0],
-    bundle_path: bundlePath,
+    bundle_entry: staged.bundleEntry,
+    bundle_path: staged.bundlePath,
   };
   appendGitHubOutput(githubOutput, proof);
   return proof;

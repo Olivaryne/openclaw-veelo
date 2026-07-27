@@ -1,0 +1,404 @@
+name: OpenClaw Veelo Secret-Safe Verification
+
+on:
+  pull_request:
+    branches:
+      - veelo-main
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openclaw-veelo-ci-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CI: true
+  NPM_CONFIG_USERCONFIG: /dev/null
+
+jobs:
+  integrity:
+    name: workflow-and-scope-integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      governed: ${{ steps.scope.outputs.governed }}
+      actual_head_sha: ${{ steps.scope.outputs.actual_head_sha }}
+      node_version: ${{ steps.runtime.outputs.node_version }}
+      pnpm_version: ${{ steps.runtime.outputs.pnpm_version }}
+    steps:
+      - name: Check out exact pull request head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out trusted pull request base tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+
+      - name: Validate trusted workflow and target manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          node trusted/scripts/ci/openclaw-ci.mjs validate-workflow \
+            --workflow trusted/.github/workflows/openclaw-veelo-ci.yml
+          node trusted/scripts/ci/openclaw-ci.mjs validate-target \
+            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json
+
+      - name: Validate source workflow when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f source/.github/workflows/openclaw-veelo-ci.yml ]]; then
+            node trusted/scripts/ci/openclaw-ci.mjs validate-workflow \
+              --workflow source/.github/workflows/openclaw-veelo-ci.yml
+          fi
+
+      - name: Record bounded runtime identity
+        id: runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          node_version="$(node --version)"
+          pnpm_version="$(cd trusted && corepack pnpm --version)"
+          printf 'node_version=%s\n' "$node_version" >> "$GITHUB_OUTPUT"
+          printf 'pnpm_version=%s\n' "$pnpm_version" >> "$GITHUB_OUTPUT"
+          printf 'runner_image=%s\n' 'ubuntu-24.04'
+
+      - name: Verify exact head ancestry and governed scope
+        id: scope
+        shell: bash
+        env:
+          PR_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          node trusted/scripts/ci/openclaw-ci.mjs verify-pr \
+            --source source \
+            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json \
+            --repository "$PR_REPOSITORY" \
+            --pr-number "$PR_NUMBER" \
+            --base-branch "$PR_BASE_BRANCH" \
+            --head-branch "$PR_HEAD_BRANCH" \
+            --base-sha "$PR_BASE_SHA" \
+            --head-sha "$PR_HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Check out immutable parent contract
+        if: steps.scope.outputs.governed == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: Olivaryne/veelo
+          ref: 4233aab48219f17f3a8d9ad7d2018c9fc95b93a6
+          path: parent-contract
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify immutable parent and child contracts
+        if: steps.scope.outputs.governed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node trusted/scripts/ci/openclaw-ci.mjs verify-contracts \
+            --source source \
+            --parent parent-contract \
+            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json
+
+  focused:
+    name: workboard-focused-verification
+    needs: integrity
+    if: needs.integrity.outputs.governed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact pull request head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out trusted pull request base tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+
+      - name: Install frozen dependencies with Corepack
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+
+      - name: Run complete focused Workboard suite
+        working-directory: source
+        shell: bash
+        env:
+          OPENCLAW_VITEST_MAX_WORKERS: 2
+        run: |
+          set -euo pipefail
+          node scripts/run-vitest.mjs extensions/workboard
+
+  rollback:
+    name: exact-rollback-fixture
+    needs: integrity
+    if: needs.integrity.outputs.governed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      package_version: ${{ steps.package.outputs.package_version }}
+      registry_integrity: ${{ steps.package.outputs.registry_integrity }}
+      artifact_digest: ${{ steps.package.outputs.artifact_digest }}
+    steps:
+      - name: Check out exact pull request head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out trusted pull request base tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+
+      - name: Install frozen dependencies with Corepack
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+
+      - name: Resolve and verify exact public rollback package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          node trusted/scripts/ci/openclaw-ci.mjs prepare-rollback \
+            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json \
+            --output-dir '${{ runner.temp }}/openclaw-rollback-package' \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Run mandatory exact rollback fixture
+        working-directory: source
+        shell: bash
+        env:
+          OPENCLAW_REQUIRE_ROLLBACK_FIXTURE: "1"
+          OPENCLAW_ROLLBACK_BUNDLE: ${{ steps.package.outputs.bundle_path }}
+          OPENCLAW_VITEST_MAX_WORKERS: 1
+        run: |
+          set -euo pipefail
+          node scripts/run-vitest.mjs extensions/workboard/src/sqlite-store.test.ts \
+            -t "2026.7.1-2 bundle"
+
+  blast_radius:
+    name: static-and-blast-radius-verification
+    needs: integrity
+    if: needs.integrity.outputs.governed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact pull request head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check out trusted pull request base tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+
+      - name: Install frozen dependencies with Corepack
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+
+      - name: Run required typecheck lanes
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack pnpm tsgo
+          corepack pnpm tsgo:extensions
+          corepack pnpm tsgo:extensions:test
+
+      - name: Run full build
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack pnpm build
+
+      - name: Run exact changed-file lint and formatting
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed_files=(
+            extensions/workboard/src/gateway.test.ts
+            extensions/workboard/src/gateway.ts
+            extensions/workboard/src/sqlite-store.test.ts
+            extensions/workboard/src/sqlite-store.ts
+            extensions/workboard/src/store.test.ts
+            extensions/workboard/src/store.ts
+            extensions/workboard/src/types.ts
+          )
+          node scripts/run-oxlint.mjs "${changed_files[@]}"
+          corepack pnpm exec oxfmt --check "${changed_files[@]}"
+
+      - name: Run import-cycle check
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack pnpm check:import-cycles
+
+      - name: Run Workboard blast-radius tests
+        working-directory: source
+        shell: bash
+        env:
+          OPENCLAW_VITEST_MAX_WORKERS: 2
+        run: |
+          set -euo pipefail
+          node scripts/run-vitest.mjs \
+            src/agents/worktrees/registry.test.ts \
+            src/agents/worktrees/service.test.ts \
+            src/gateway/server-methods.authorization.test.ts \
+            src/gateway/server-plugins.test.ts \
+            src/plugins/bundled-plugin-metadata.test.ts \
+            src/plugins/contracts/boundary-invariants.test.ts \
+            src/plugins/contracts/plugin-sdk-runtime-api-guardrails.test.ts \
+            test/scripts/plugin-gateway-gauntlet.test.ts
+
+      - name: Compare dependency audit findings with exact base
+        shell: bash
+        run: |
+          set -euo pipefail
+          node trusted/scripts/ci/openclaw-ci.mjs compare-audit \
+            --base trusted \
+            --head source
+
+  receipt:
+    name: bounded-receipt
+    needs: [integrity, focused, rollback, blast_radius]
+    if: needs.integrity.outputs.governed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted pull request base tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+
+      - name: Generate and validate bounded receipt files
+        shell: bash
+        env:
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_ACTUAL_HEAD_SHA: ${{ needs.integrity.outputs.actual_head_sha }}
+          CI_WORKFLOW_RUN_ID: ${{ github.run_id }}
+          CI_WORKFLOW_NAME: ${{ github.workflow }}
+          CI_RUNNER_IMAGE: ubuntu-24.04
+          CI_NODE_VERSION: ${{ needs.integrity.outputs.node_version }}
+          CI_PNPM_VERSION: ${{ needs.integrity.outputs.pnpm_version }}
+          CI_ROLLBACK_VERSION: ${{ needs.rollback.outputs.package_version }}
+          CI_ROLLBACK_INTEGRITY: ${{ needs.rollback.outputs.registry_integrity }}
+          CI_ROLLBACK_DIGEST: ${{ needs.rollback.outputs.artifact_digest }}
+          CI_JOBS_JSON: >-
+            [{"name":"workflow-and-scope-integrity","conclusion":"${{ needs.integrity.result }}"},
+            {"name":"workboard-focused-verification","conclusion":"${{ needs.focused.result }}"},
+            {"name":"exact-rollback-fixture","conclusion":"${{ needs.rollback.result }}"},
+            {"name":"static-and-blast-radius-verification","conclusion":"${{ needs.blast_radius.result }}"}]
+        run: |
+          set -euo pipefail
+          node trusted/scripts/ci/openclaw-ci.mjs generate-receipt \
+            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json \
+            --output-dir '${{ runner.temp }}/openclaw-ci-receipt'
+
+      - name: Upload bounded receipt files only
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: openclaw-ci-receipt-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/openclaw-ci-receipt/ci-receipt.json
+            ${{ runner.temp }}/openclaw-ci-receipt/test-summary.txt
+            ${{ runner.temp }}/openclaw-ci-receipt/rollback-package-integrity.txt
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7

@@ -1,0 +1,11 @@
+{
+  "schema_version": "openclaw-private-contract-attestation/1",
+  "source_repository": "Olivaryne/veelo",
+  "source_commit_sha": "4233aab48219f17f3a8d9ad7d2018c9fc95b93a6",
+  "source_path": "docs/architecture/aut-wb-atomic-create-or-recover-contract.md",
+  "source_git_blob_sha": "f3b58cd7f807ce1e3773c41b7601e04a52a8a064",
+  "source_sha256": "c3680fa42c1df3cd156cc57a44230c2cb3f3628a3670d1b2774cc2804c9654e4",
+  "verification_method": "operator-authenticated-private-source-read",
+  "authority_kind": "digest-attestation",
+  "content_embedded": false
+}

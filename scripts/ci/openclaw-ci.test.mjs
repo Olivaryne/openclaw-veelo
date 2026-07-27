@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  readParentAttestation,
+  scanLinesForDisclosure,
   validateGovernedScope,
+  validateParentAttestation,
   validateReceipt,
   validateTargetManifest,
   validateWorkflowText,
+  verifyContractReferences,
   verifyExactHead,
   writeReceiptArtifacts,
 } from "./openclaw-ci.mjs";
@@ -21,6 +27,12 @@ const manifest = JSON.parse(
 const workflow = fs.readFileSync(
   path.join(root, ".github/workflows/openclaw-veelo-ci.yml"),
   "utf8",
+);
+const attestation = JSON.parse(
+  fs.readFileSync(
+    path.join(root, "ci/openclaw/attestations/aut-wb-parent-contract.v1.json"),
+    "utf8",
+  ),
 );
 const permittedFiles = [...manifest.permitted_files.production, ...manifest.permitted_files.tests];
 
@@ -147,6 +159,54 @@ const workflowMutations = [
     "${{ runner.temp }}/openclaw-ci-receipt",
     /unsafe or missing artifact path/,
   ],
+  [
+    "cross-repository private checkout",
+    "repository: ${{ github.repository }}",
+    "repository: Olivaryne/veelo",
+    /cross-repository checkout is prohibited/,
+  ],
+  [
+    "missing attestation validation",
+    "validate-attestation",
+    "validate-nothing",
+    /missing required fragment: validate-attestation/,
+  ],
+  [
+    "secret-based private checkout",
+    "persist-credentials: false",
+    "token: ${{ secrets.VEELO_PAT }}",
+    /secret expressions/,
+  ],
+  [
+    "GitHub App token-generation action",
+    /actions\/checkout@[0-9a-f]{40}/,
+    `actions/create-github-app-token@${"a".repeat(40)}`,
+    /unauthorized action/,
+  ],
+  [
+    "cross-repository gh api fetch",
+    "corepack enable",
+    "gh api repos/Olivaryne/veelo/contents/docs",
+    /prohibited external-effect command/,
+  ],
+  [
+    "curl fetch",
+    "corepack enable",
+    "curl -s https://example.com/private",
+    /prohibited external-effect command/,
+  ],
+  [
+    "PAT-shaped environment name",
+    "CI: true",
+    "GH_PAT: placeholder",
+    /credential-shaped environment name/,
+  ],
+  [
+    "attestation from the untrusted source checkout",
+    "--parent-attestation trusted/ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
+    "--parent-attestation source/ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
+    /trusted attestation directory/,
+  ],
 ];
 
 for (const [name, search, replacement, expected] of workflowMutations) {
@@ -156,6 +216,593 @@ for (const [name, search, replacement, expected] of workflowMutations) {
     assert.throws(() => validateWorkflowText(mutated), expected);
   });
 }
+
+const credentialEnvNames = [
+  "APP_PRIVATE_KEY",
+  "GITHUB_APP_PRIVATE_KEY",
+  "PRIVATE_KEY",
+  "SSH_PRIVATE_KEY",
+  "SIGNING_PRIVATE_KEY",
+  "APP_PRIVATEKEY",
+  "PRIVATEKEY",
+  "app_private_key",
+  "API_TOKEN",
+  "CLIENT_SECRET",
+  "DB_PASSWORD",
+  "APP_CREDENTIAL",
+  "GITHUB_PAT",
+];
+
+for (const envName of credentialEnvNames) {
+  test(`credential-shaped environment name ${envName} is rejected`, () => {
+    const mutated = workflow.replace("CI: true", `${envName}: placeholder`);
+    assert.notEqual(mutated, workflow);
+    assert.throws(() => validateWorkflowText(mutated), /credential-shaped environment name/);
+  });
+}
+
+const benignEnvNames = [
+  "CORRELATION_KEY",
+  "IDEMPOTENCY_KEY",
+  "PUBLIC_KEY_ID",
+  "MONKEY",
+  "KEYSTONE_MODE",
+  "CACHE_KEY",
+];
+
+for (const envName of benignEnvNames) {
+  test(`benign environment name ${envName} is not rejected`, () => {
+    const mutated = workflow.replace("CI: true", `${envName}: fixture-value`);
+    assert.notEqual(mutated, workflow);
+    assert.ok(validateWorkflowText(mutated).action_count > 0);
+  });
+}
+
+test("checked-in parent attestation yields the bounded trusted-digest evidence", () => {
+  assert.deepEqual(validateParentAttestation(clone(attestation), manifest), {
+    parent_reference:
+      "Olivaryne/veelo:docs/architecture/aut-wb-atomic-create-or-recover-contract.md@4233aab48219f17f3a8d9ad7d2018c9fc95b93a6",
+    source_git_blob_sha: "f3b58cd7f807ce1e3773c41b7601e04a52a8a064",
+    source_sha256: "c3680fa42c1df3cd156cc57a44230c2cb3f3628a3670d1b2774cc2804c9654e4",
+    verification_mode: "trusted-digest-attestation",
+  });
+});
+
+const attestationMutations = [
+  {
+    name: "unknown or content-bearing field",
+    mutate: (value) => {
+      value.contract_markdown = "# smuggled contract body";
+    },
+    expected: /fields must be exactly/,
+  },
+  {
+    name: "base64-like contract payload field",
+    mutate: (value) => {
+      value.contract_b64 = "A".repeat(130);
+    },
+    expected: /fields must be exactly/,
+  },
+  {
+    name: "missing field",
+    mutate: (value) => {
+      delete value.source_sha256;
+    },
+    expected: /fields must be exactly/,
+  },
+  {
+    name: "wrong schema version",
+    mutate: (value) => {
+      value.schema_version = "openclaw-private-contract-attestation/2";
+    },
+    expected: /schema_version/,
+  },
+  {
+    name: "repository drift",
+    mutate: (value) => {
+      value.source_repository = "Olivaryne/other";
+    },
+    expected: /repository does not match/,
+  },
+  {
+    name: "malformed repository",
+    mutate: (value) => {
+      value.source_repository = "not a repository";
+    },
+    expected: /source_repository is malformed/,
+  },
+  {
+    name: "commit drift",
+    mutate: (value) => {
+      value.source_commit_sha = "e".repeat(40);
+    },
+    expected: /commit does not match/,
+  },
+  {
+    name: "short commit SHA",
+    mutate: (value) => {
+      value.source_commit_sha = "abc123";
+    },
+    expected: /lowercase full 40-character SHA/,
+  },
+  {
+    name: "path drift",
+    mutate: (value) => {
+      value.source_path = "docs/architecture/other-contract.md";
+    },
+    expected: /path does not match/,
+  },
+  {
+    name: "absolute source path",
+    mutate: (value) => {
+      value.source_path = "/etc/contract.md";
+    },
+    expected: /normalized repository-relative path/,
+  },
+  {
+    name: "traversal source path",
+    mutate: (value) => {
+      value.source_path = "docs/../../secrets/contract.md";
+    },
+    expected: /normalized repository-relative path/,
+  },
+  {
+    name: "uppercase blob SHA",
+    mutate: (value) => {
+      value.source_git_blob_sha = "F".repeat(40);
+    },
+    expected: /lowercase full 40-character SHA/,
+  },
+  {
+    name: "short blob SHA",
+    mutate: (value) => {
+      value.source_git_blob_sha = "f3b58c";
+    },
+    expected: /lowercase full 40-character SHA/,
+  },
+  {
+    name: "digest drift",
+    mutate: (value) => {
+      value.source_sha256 = "d".repeat(64);
+    },
+    expected: /digest does not match/,
+  },
+  {
+    name: "uppercase SHA-256",
+    mutate: (value) => {
+      value.source_sha256 = "C".repeat(64);
+    },
+    expected: /64-character SHA-256/,
+  },
+  {
+    name: "embedded-content claim",
+    mutate: (value) => {
+      value.content_embedded = true;
+    },
+    expected: /must not embed/,
+  },
+  {
+    name: "wrong verification method",
+    mutate: (value) => {
+      value.verification_method = "remote-private-checkout";
+    },
+    expected: /verification_method/,
+  },
+  {
+    name: "wrong authority kind",
+    mutate: (value) => {
+      value.authority_kind = "signed-attestation";
+    },
+    expected: /authority_kind/,
+  },
+  {
+    name: "secret-shaped value",
+    mutate: (value) => {
+      value.verification_method = ["ghp", "_", "b".repeat(26)].join("");
+    },
+    expected: /secret-shaped/,
+  },
+];
+
+for (const { name, mutate, expected } of attestationMutations) {
+  test(`attestation ${name} is rejected`, () => {
+    const value = clone(attestation);
+    mutate(value);
+    assert.throws(() => validateParentAttestation(value, manifest), expected);
+  });
+}
+
+const attestationRepoPath = path.join(
+  root,
+  "ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
+);
+
+const attestationBytes = fs.readFileSync(attestationRepoPath);
+const GOVERNED_ATTESTATION_PATH = "trusted/ci/openclaw/attestations/aut-wb-parent-contract.v1.json";
+
+// Stage a synthetic trusted checkout containing the real (public) attestation
+// bytes at the exact governed location. Never stages private contract bytes.
+function makeTrustedCheckout() {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-trusted-")));
+  fs.mkdirSync(path.join(base, "trusted/ci/openclaw/attestations"), { recursive: true });
+  fs.writeFileSync(path.join(base, GOVERNED_ATTESTATION_PATH), attestationBytes);
+  return base;
+}
+
+test("exact relative trusted attestation path yields the bounded evidence", () => {
+  const base = makeTrustedCheckout();
+  try {
+    assert.equal(
+      readParentAttestation(GOVERNED_ATTESTATION_PATH, manifest, base).verification_mode,
+      "trusted-digest-attestation",
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true });
+  }
+});
+
+test("manifest parent drift away from the attestation is rejected", () => {
+  const base = makeTrustedCheckout();
+  try {
+    const drifted = clone(manifest);
+    drifted.parent_contract.sha256 = "0".repeat(64);
+    assert.throws(
+      () => readParentAttestation(GOVERNED_ATTESTATION_PATH, drifted, base),
+      /digest does not match/,
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true });
+  }
+});
+
+test("absolute and lookalike attestation paths are refused despite valid contents", () => {
+  const base = makeTrustedCheckout();
+  try {
+    const evilDirs = [
+      "trusted/ci/openclaw/attestations-evil",
+      "other/trusted/ci/openclaw/attestations",
+      "source/ci/openclaw/attestations",
+      "elsewhere/ci/openclaw/attestations",
+    ];
+    for (const dir of evilDirs) {
+      fs.mkdirSync(path.join(base, dir), { recursive: true });
+      fs.writeFileSync(path.join(base, dir, "aut-wb-parent-contract.v1.json"), attestationBytes);
+    }
+
+    // 1. absolute path to the valid governed file
+    assert.throws(
+      () => readParentAttestation(path.join(base, GOVERNED_ATTESTATION_PATH), manifest, base),
+      /not absolute/,
+    );
+    // 2. absolute out-of-tree path whose string contains ci/openclaw/attestations
+    assert.throws(
+      () =>
+        readParentAttestation(
+          path.join(base, "elsewhere/ci/openclaw/attestations/aut-wb-parent-contract.v1.json"),
+          manifest,
+          base,
+        ),
+      /not absolute/,
+    );
+    // 3. relative sibling directory lookalike
+    assert.throws(
+      () =>
+        readParentAttestation(
+          "trusted/ci/openclaw/attestations-evil/aut-wb-parent-contract.v1.json",
+          manifest,
+          base,
+        ),
+      /must be exactly/,
+    );
+    // 4. embedded lookalike prefix
+    assert.throws(
+      () =>
+        readParentAttestation(
+          "other/trusted/ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
+          manifest,
+          base,
+        ),
+      /must be exactly/,
+    );
+    // untrusted source-checkout lookalike stays refused
+    assert.throws(
+      () =>
+        readParentAttestation(
+          "source/ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
+          manifest,
+          base,
+        ),
+      /must be exactly/,
+    );
+    // 5. dot-dot traversal
+    assert.throws(
+      () =>
+        readParentAttestation(
+          "trusted/ci/openclaw/attestations/../attestations/aut-wb-parent-contract.v1.json",
+          manifest,
+          base,
+        ),
+      /dot-dot/,
+    );
+    // 6. dot normalization
+    assert.throws(
+      () => readParentAttestation(`./${GOVERNED_ATTESTATION_PATH}`, manifest, base),
+      /dot or dot-dot/,
+    );
+    // 7. repeated separator
+    assert.throws(
+      () =>
+        readParentAttestation(
+          "trusted//ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
+          manifest,
+          base,
+        ),
+      /empty, dot or dot-dot/,
+    );
+    // 8. backslash path
+    assert.throws(
+      () =>
+        readParentAttestation(
+          "trusted\\ci\\openclaw\\attestations\\aut-wb-parent-contract.v1.json",
+          manifest,
+          base,
+        ),
+      /backslashes/,
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true });
+  }
+});
+
+test("symlinked path components are refused at every level", () => {
+  // 9-13: each component from the trusted root to the leaf is swapped for a
+  // symlink pointing at a real tree holding valid attestation bytes.
+  const symlinkCases = [
+    ["trusted", "trusted"],
+    ["trusted/ci", "ci"],
+    ["trusted/ci/openclaw", "openclaw"],
+    ["trusted/ci/openclaw/attestations", "attestations"],
+    [GOVERNED_ATTESTATION_PATH, "aut-wb-parent-contract.v1.json"],
+  ];
+  for (const [linkRelPath, component] of symlinkCases) {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-symlink-")));
+    try {
+      const realTree = path.join(base, "real");
+      fs.mkdirSync(path.join(realTree, "trusted/ci/openclaw/attestations"), { recursive: true });
+      fs.writeFileSync(path.join(realTree, GOVERNED_ATTESTATION_PATH), attestationBytes);
+      fs.mkdirSync(path.dirname(path.join(base, linkRelPath)), { recursive: true });
+      fs.symlinkSync(path.join(realTree, linkRelPath), path.join(base, linkRelPath));
+      assert.throws(
+        () => readParentAttestation(GOVERNED_ATTESTATION_PATH, manifest, base),
+        new RegExp(`symbolic link: ${component}`),
+        `symlinked ${component} must be refused`,
+      );
+    } finally {
+      fs.rmSync(base, { recursive: true });
+    }
+  }
+});
+
+test("symlinked leaf resolving outside the trusted tree is refused", () => {
+  // 14: the final path would resolve entirely outside the trusted checkout.
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-escape-")));
+  try {
+    fs.mkdirSync(path.join(base, "trusted/ci/openclaw/attestations"), { recursive: true });
+    fs.writeFileSync(path.join(base, "outside-secret.json"), attestationBytes);
+    fs.symlinkSync(
+      path.join(base, "outside-secret.json"),
+      path.join(base, GOVERNED_ATTESTATION_PATH),
+    );
+    assert.throws(
+      () => readParentAttestation(GOVERNED_ATTESTATION_PATH, manifest, base),
+      /symbolic link: aut-wb-parent-contract\.v1\.json/,
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true });
+  }
+});
+
+test("directory, missing and non-regular objects at the leaf are refused", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-object-")));
+  try {
+    // 15. directory at the final file location
+    fs.mkdirSync(path.join(base, GOVERNED_ATTESTATION_PATH), { recursive: true });
+    assert.throws(
+      () => readParentAttestation(GOVERNED_ATTESTATION_PATH, manifest, base),
+      /regular file/,
+    );
+    fs.rmdirSync(path.join(base, GOVERNED_ATTESTATION_PATH));
+    // 16. missing file
+    assert.throws(
+      () => readParentAttestation(GOVERNED_ATTESTATION_PATH, manifest, base),
+      /file is missing/,
+    );
+    // 17. FIFO where the platform supports it
+    let fifoMade = false;
+    try {
+      execFileSync("mkfifo", [path.join(base, GOVERNED_ATTESTATION_PATH)]);
+      fifoMade = true;
+    } catch {
+      // platform without mkfifo: case is exercised on supported platforms only
+    }
+    if (fifoMade) {
+      assert.throws(
+        () => readParentAttestation(GOVERNED_ATTESTATION_PATH, manifest, base),
+        /regular file/,
+      );
+    }
+  } finally {
+    fs.rmSync(base, { recursive: true });
+  }
+});
+
+function makeChildContractRepo(contents) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-child-")));
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: "fixture",
+    GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+    GIT_COMMITTER_NAME: "fixture",
+    GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+  };
+  const run = (args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env });
+  run(["init", "-q"]);
+  fs.mkdirSync(path.join(dir, "contracts/automation"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "contracts/automation/child.md"), contents);
+  run(["add", "."]);
+  run(["commit", "-qm", "child contract fixture"]);
+  return { dir, sha: run(["rev-parse", "HEAD"]).trim() };
+}
+
+test("combined contract verification succeeds and reports the honest parent mode", () => {
+  const contents = "# synthetic child contract fixture\n";
+  const child = makeChildContractRepo(contents);
+  try {
+    const fixtureManifest = clone(manifest);
+    fixtureManifest.child_contract = {
+      repository: manifest.child_contract.repository,
+      path: "contracts/automation/child.md",
+      commit_sha: child.sha,
+      sha256: createHash("sha256").update(contents).digest("hex"),
+    };
+    const trustedBase = makeTrustedCheckout();
+    let result;
+    try {
+      result = verifyContractReferences(
+        fixtureManifest,
+        child.dir,
+        GOVERNED_ATTESTATION_PATH,
+        trustedBase,
+      );
+    } finally {
+      fs.rmSync(trustedBase, { recursive: true });
+    }
+    assert.equal(result.parent.verification_mode, "trusted-digest-attestation");
+    assert.equal(result.parent.source_git_blob_sha, attestation.source_git_blob_sha);
+    assert.equal(
+      result.child,
+      `${manifest.child_contract.repository}:contracts/automation/child.md@${child.sha}`,
+    );
+  } finally {
+    fs.rmSync(child.dir, { recursive: true });
+  }
+});
+
+test("child contract digest drift is rejected", () => {
+  const child = makeChildContractRepo("# synthetic child contract fixture\n");
+  try {
+    const fixtureManifest = clone(manifest);
+    fixtureManifest.child_contract = {
+      repository: manifest.child_contract.repository,
+      path: "contracts/automation/child.md",
+      commit_sha: child.sha,
+      sha256: "0".repeat(64),
+    };
+    const trustedBase = makeTrustedCheckout();
+    try {
+      assert.throws(
+        () =>
+          verifyContractReferences(
+            fixtureManifest,
+            child.dir,
+            GOVERNED_ATTESTATION_PATH,
+            trustedBase,
+          ),
+        /child contract digest mismatch/,
+      );
+    } finally {
+      fs.rmSync(trustedBase, { recursive: true });
+    }
+  } finally {
+    fs.rmSync(child.dir, { recursive: true });
+  }
+});
+
+test("child contract commit or path drift is rejected", () => {
+  const contents = "# synthetic child contract fixture\n";
+  const child = makeChildContractRepo(contents);
+  try {
+    const fixtureManifest = clone(manifest);
+    fixtureManifest.child_contract = {
+      repository: manifest.child_contract.repository,
+      path: "contracts/automation/absent.md",
+      commit_sha: child.sha,
+      sha256: createHash("sha256").update(contents).digest("hex"),
+    };
+    const trustedBase = makeTrustedCheckout();
+    try {
+      assert.throws(() =>
+        verifyContractReferences(
+          fixtureManifest,
+          child.dir,
+          GOVERNED_ATTESTATION_PATH,
+          trustedBase,
+        ),
+      );
+    } finally {
+      fs.rmSync(trustedBase, { recursive: true });
+    }
+  } finally {
+    fs.rmSync(child.dir, { recursive: true });
+  }
+});
+
+test("action pins, permissions and the five-job set remain unchanged", () => {
+  const uses = [...workflow.matchAll(/^\s*uses:\s*([^\s#]+)/gm)].map((match) => match[1]);
+  const byName = (left, right) => (left < right ? -1 : left > right ? 1 : 0);
+  assert.deepEqual([...new Set(uses)].toSorted(byName), [
+    "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+    "actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f",
+    "actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f",
+  ]);
+  assert.ok(workflow.includes("permissions:\n  contents: read"));
+  assert.equal((workflow.match(/^\s*permissions:/gm) ?? []).length, 1);
+  const mutated = `${workflow}\n  extra_job:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 5\n`;
+  assert.throws(() => validateWorkflowText(mutated), /job set is not closed/);
+});
+
+test("disclosure scanner flags synthetic secret, payload and credential fixtures", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-disclosure-"));
+  try {
+    const fixtures = [
+      ["secret.txt", ["ghp", "_", "c".repeat(26)].join(""), "secret-shaped value"],
+      ["payload.txt", "Q".repeat(130), "base64-or-archive payload"],
+      [
+        "url.txt",
+        ["https://operator", "hunter2@private.example/veelo.git"].join(":"),
+        "credential-bearing URL",
+      ],
+    ];
+    for (const [name, contents, kind] of fixtures) {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, `${contents}\n`);
+      const findings = scanLinesForDisclosure(fs.readFileSync(file, "utf8").split("\n"));
+      assert.ok(
+        findings.some((finding) => finding.kind === kind),
+        `${name} must flag ${kind}`,
+      );
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true });
+  }
+});
+
+test("remediation surface contains no disclosure-shaped content", () => {
+  const remediationFiles = [
+    ".github/workflows/openclaw-veelo-ci.yml",
+    "ci/openclaw/SECURITY_POLICY.md",
+    "ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
+    "scripts/ci/openclaw-ci.mjs",
+    "scripts/ci/openclaw-ci.test.mjs",
+  ];
+  for (const file of remediationFiles) {
+    const findings = scanLinesForDisclosure(
+      fs.readFileSync(path.join(root, file), "utf8").split("\n"),
+    );
+    assert.deepEqual(findings, [], `${file} must be disclosure-clean`);
+  }
+  assert.ok(attestationBytes.length < 1024, "attestation must stay tiny with no embedded content");
+});
 
 test("valid receipt is accepted", () => {
   assert.equal(validateReceipt(validReceipt(), manifest).final_conclusion, "success");

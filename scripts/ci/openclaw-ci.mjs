@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SRI_RE = /^sha512-[A-Za-z0-9+/]{86}==$/;
 const VERSION_RE = /^\d{4}\.\d+\.\d+(?:-\d+)?$/;
 const CONTRACT_REF_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+@[0-9a-f]{40}$/;
@@ -171,7 +172,7 @@ export function validateTargetManifest(value) {
     }
   }
   const expectedClasses = ["dependency", "deployment", "generated", "secret-bearing", "workflow"];
-  if (JSON.stringify(classNames.toSorted()) !== JSON.stringify(expectedClasses)) {
+  if (!sameStringSet(classNames, expectedClasses)) {
     fail(`prohibited path classes must be exactly ${expectedClasses.join(", ")}`);
   }
 
@@ -211,6 +212,146 @@ export function readTargetManifest(file) {
   return validateTargetManifest(parsed);
 }
 
+// The parent proof is a trusted digest attestation, not live private-source
+// verification: CI never reads the private parent bytes. Every shared field
+// must equal the reviewed manifest authority exactly, so the attestation
+// cannot retarget the parent or smuggle content past review.
+export function validateParentAttestation(value, manifest) {
+  exactKeys(
+    value,
+    [
+      "authority_kind",
+      "content_embedded",
+      "schema_version",
+      "source_commit_sha",
+      "source_git_blob_sha",
+      "source_path",
+      "source_repository",
+      "source_sha256",
+      "verification_method",
+    ],
+    "parent attestation",
+  );
+  if (secretMatches(value).length > 0) {
+    fail("secret-shaped value found in parent attestation");
+  }
+  if (value.schema_version !== "openclaw-private-contract-attestation/1") {
+    fail("unsupported parent attestation schema_version");
+  }
+  nonEmptyString(value.source_repository, "parent attestation source_repository");
+  if (!REPO_RE.test(value.source_repository)) {
+    fail("parent attestation source_repository is malformed");
+  }
+  safeRelativePath(value.source_path, "parent attestation source_path");
+  fullSha(value.source_commit_sha, "parent attestation source_commit_sha");
+  fullSha(value.source_git_blob_sha, "parent attestation source_git_blob_sha");
+  digest(value.source_sha256, "parent attestation source_sha256");
+  if (value.source_repository !== manifest.parent_contract.repository) {
+    fail("parent attestation repository does not match manifest authority");
+  }
+  if (value.source_path !== manifest.parent_contract.path) {
+    fail("parent attestation path does not match manifest authority");
+  }
+  if (value.source_commit_sha !== manifest.parent_contract.commit_sha) {
+    fail("parent attestation commit does not match manifest authority");
+  }
+  if (value.source_sha256 !== manifest.parent_contract.sha256) {
+    fail("parent attestation digest does not match manifest authority");
+  }
+  if (value.verification_method !== "operator-authenticated-private-source-read") {
+    fail("unsupported parent attestation verification_method");
+  }
+  if (value.authority_kind !== "digest-attestation") {
+    fail("unsupported parent attestation authority_kind");
+  }
+  if (value.content_embedded !== false) {
+    fail("parent attestation must not embed private contract content");
+  }
+  return {
+    parent_reference: contractReference(manifest.parent_contract),
+    source_git_blob_sha: value.source_git_blob_sha,
+    source_sha256: value.source_sha256,
+    verification_mode: "trusted-digest-attestation",
+  };
+}
+
+// The only accepted attestation location. The reader proves the supplied
+// path is this exact regular file inside the exact trusted checkout tree;
+// content validity never rescues an untrusted location.
+const TRUSTED_ATTESTATION_SEGMENTS = [
+  "trusted",
+  "ci",
+  "openclaw",
+  "attestations",
+  "aut-wb-parent-contract.v1.json",
+];
+const TRUSTED_ATTESTATION_PATH = TRUSTED_ATTESTATION_SEGMENTS.join("/");
+
+// trustedBaseDir exists only so hermetic tests can stage a synthetic trusted
+// checkout; the CLI never forwards an argument for it, so production always
+// resolves against the workflow working directory that contains `trusted/`.
+function assertTrustedAttestationFile(file, trustedBaseDir) {
+  nonEmptyString(file, "attestation path");
+  if (file.includes("\\")) {
+    fail("parent attestation path must not contain backslashes");
+  }
+  if (path.isAbsolute(file) || path.posix.isAbsolute(file)) {
+    fail("parent attestation path must be relative to the trusted checkout, not absolute");
+  }
+  const segments = file.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    fail("parent attestation path must be normalized without empty, dot or dot-dot components");
+  }
+  if (file !== TRUSTED_ATTESTATION_PATH) {
+    fail(`parent attestation path must be exactly ${TRUSTED_ATTESTATION_PATH}`);
+  }
+  if (path.posix.normalize(file) !== file) {
+    fail("parent attestation path changes identity under normalization");
+  }
+  // Walk every component from the trusted checkout root to the leaf; a
+  // symlink anywhere on that chain could swap the governed file for
+  // attacker-chosen bytes after the lexical checks.
+  let current = trustedBaseDir;
+  for (const segment of TRUSTED_ATTESTATION_SEGMENTS) {
+    current = path.join(current, segment);
+    let stats;
+    try {
+      stats = fs.lstatSync(current);
+    } catch {
+      fail("parent attestation file is missing");
+    }
+    if (stats.isSymbolicLink()) {
+      fail(`parent attestation path component must not be a symbolic link: ${segment}`);
+    }
+  }
+  if (!fs.lstatSync(current).isFile()) {
+    fail("parent attestation must be a regular file");
+  }
+  const expectedDirectory = fs.realpathSync(
+    path.join(trustedBaseDir, ...TRUSTED_ATTESTATION_SEGMENTS.slice(0, -1)),
+  );
+  const resolvedDirectory = fs.realpathSync(path.dirname(current));
+  if (resolvedDirectory !== expectedDirectory) {
+    fail("parent attestation directory escapes the trusted checkout");
+  }
+  const resolvedFile = fs.realpathSync(current);
+  if (resolvedFile !== path.join(expectedDirectory, TRUSTED_ATTESTATION_SEGMENTS.at(-1))) {
+    fail("parent attestation file escapes the trusted checkout");
+  }
+  return current;
+}
+
+export function readParentAttestation(file, manifest, trustedBaseDir = process.cwd()) {
+  const attestationFile = assertTrustedAttestationFile(file, trustedBaseDir);
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(attestationFile, "utf8"));
+  } catch (error) {
+    fail(`parent attestation is not valid JSON: ${error.message}`);
+  }
+  return validateParentAttestation(parsed, manifest);
+}
+
 function secretMatches(value) {
   const strings = [];
   const visit = (entry) => {
@@ -229,6 +370,36 @@ function secretMatches(value) {
   return strings.flatMap((entry) =>
     SECRET_PATTERNS.filter((pattern) => pattern.test(entry)).map(() => entry),
   );
+}
+
+// Disclosure guard for the public remediation surface: flags secret-shaped
+// values, encoded payloads large enough to carry contract bytes, and
+// credential-bearing URLs. It cannot prove the absence of a plain-text
+// mirror; the closed attestation shape, exact file budget, and independent
+// review own that guarantee.
+const DISCLOSURE_PATTERNS = [
+  { kind: "base64-or-archive payload", pattern: /[A-Za-z0-9+/]{120,}={0,2}/ },
+  { kind: "credential-bearing URL", pattern: /https?:\/\/[^\s/@]+:[^\s/@]+@/i },
+];
+
+export function scanLinesForDisclosure(lines) {
+  if (!Array.isArray(lines) || lines.some((line) => typeof line !== "string")) {
+    fail("disclosure scan input must be an array of strings");
+  }
+  const findings = [];
+  for (const [index, line] of lines.entries()) {
+    for (const pattern of SECRET_PATTERNS) {
+      if (pattern.test(line)) {
+        findings.push({ line: index + 1, kind: "secret-shaped value" });
+      }
+    }
+    for (const entry of DISCLOSURE_PATTERNS) {
+      if (entry.pattern.test(line)) {
+        findings.push({ line: index + 1, kind: entry.kind });
+      }
+    }
+  }
+  return findings;
 }
 
 function runGit(cwd, args, options = {}) {
@@ -370,14 +541,15 @@ function sha256Bytes(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-export function verifyContractReferences(manifest, sourceDir, parentDir) {
-  const parentHead = runGit(parentDir, ["rev-parse", "HEAD"]).trim();
-  verifyExactHead(parentHead, manifest.parent_contract.commit_sha);
-  const parentPath = path.join(parentDir, manifest.parent_contract.path);
-  const parentBytes = fs.readFileSync(parentPath);
-  if (sha256Bytes(parentBytes) !== manifest.parent_contract.sha256) {
-    fail("parent contract digest mismatch");
-  }
+export function verifyContractReferences(
+  manifest,
+  sourceDir,
+  attestationFile,
+  trustedBaseDir = process.cwd(),
+) {
+  // Parent: trusted digest attestation only. Child: exact bytes from the PR
+  // source Git history, byte-verified on every run.
+  const parentEvidence = readParentAttestation(attestationFile, manifest, trustedBaseDir);
 
   const childSpec = `${manifest.child_contract.commit_sha}:${manifest.child_contract.path}`;
   const childBytes = runGit(sourceDir, ["show", childSpec], { encoding: "buffer" });
@@ -385,7 +557,7 @@ export function verifyContractReferences(manifest, sourceDir, parentDir) {
     fail("child contract digest mismatch");
   }
   return {
-    parent: contractReference(manifest.parent_contract),
+    parent: parentEvidence,
     child: contractReference(manifest.child_contract),
   };
 }
@@ -456,6 +628,33 @@ export function validateWorkflowText(text) {
   if ([...text.matchAll(/^\s*uses:\s*/gm)].length === 0) {
     fail("workflow must use the pinned action allowlist");
   }
+  const allowedCheckoutRepositories = new Set([
+    "${{ github.event.pull_request.head.repo.full_name }}",
+    "${{ github.repository }}",
+  ]);
+  for (const match of text.matchAll(/^\s*repository:\s*(.*?)\s*$/gm)) {
+    if (!allowedCheckoutRepositories.has(match[1])) {
+      fail(`cross-repository checkout is prohibited: ${match[1]}`);
+    }
+  }
+  // Underscore-style keys only: hyphenated YAML keywords such as
+  // persist-credentials never reach this check, and matching is done on the
+  // uppercased key so lowercase env names cannot bypass it.
+  for (const match of text.matchAll(/^[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*:/gm)) {
+    const key = match[1].toUpperCase();
+    if (
+      /TOKEN|SECRET|PASSWORD|CREDENTIAL/.test(key) ||
+      /(?:^|_)PAT(?:_|$)/.test(key) ||
+      /PRIVATE_?KEY/.test(key)
+    ) {
+      fail(`credential-shaped environment name is prohibited: ${match[1]}`);
+    }
+  }
+  for (const match of text.matchAll(/--parent-attestation[ \t]+(\S+)/g)) {
+    if (!match[1].startsWith("trusted/ci/openclaw/attestations/")) {
+      fail(`parent attestation must come from the trusted attestation directory: ${match[1]}`);
+    }
+  }
   const requiredFragments = [
     "pull_request:\n    branches:\n      - veelo-main",
     "types: [opened, synchronize, reopened, ready_for_review]",
@@ -471,6 +670,8 @@ export function validateWorkflowText(text) {
     "name: exact-rollback-fixture",
     "name: static-and-blast-radius-verification",
     "name: bounded-receipt",
+    "validate-attestation",
+    "--parent-attestation trusted/ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
     "corepack pnpm install --frozen-lockfile",
     "node scripts/run-vitest.mjs extensions/workboard",
     'OPENCLAW_REQUIRE_ROLLBACK_FIXTURE: "1"',
@@ -858,7 +1059,7 @@ function runAudit(cwd) {
   try {
     return JSON.parse(result.stdout);
   } catch {
-    fail(`pnpm audit returned malformed JSON in ${cwd}`);
+    return fail(`pnpm audit returned malformed JSON in ${cwd}`);
   }
 }
 
@@ -1032,6 +1233,12 @@ function main(argv) {
     printResult({ valid: true, ...validateWorkflowFile(requiredArg(args, "workflow")) });
     return;
   }
+  if (command === "validate-attestation") {
+    const manifest = readTargetManifest(requiredArg(args, "manifest"));
+    const evidence = readParentAttestation(requiredArg(args, "parent-attestation"), manifest);
+    printResult({ valid: true, ...evidence });
+    return;
+  }
   if (command === "verify-pr") {
     const manifest = readTargetManifest(requiredArg(args, "manifest"));
     const result = verifyPullRequest({
@@ -1054,7 +1261,11 @@ function main(argv) {
   if (command === "verify-contracts") {
     const manifest = readTargetManifest(requiredArg(args, "manifest"));
     printResult(
-      verifyContractReferences(manifest, requiredArg(args, "source"), requiredArg(args, "parent")),
+      verifyContractReferences(
+        manifest,
+        requiredArg(args, "source"),
+        requiredArg(args, "parent-attestation"),
+      ),
     );
     return;
   }

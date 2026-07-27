@@ -275,32 +275,77 @@ export function validateParentAttestation(value, manifest) {
   };
 }
 
-export function readParentAttestation(file, manifest) {
+// The only accepted attestation location. The reader proves the supplied
+// path is this exact regular file inside the exact trusted checkout tree;
+// content validity never rescues an untrusted location.
+const TRUSTED_ATTESTATION_SEGMENTS = [
+  "trusted",
+  "ci",
+  "openclaw",
+  "attestations",
+  "aut-wb-parent-contract.v1.json",
+];
+const TRUSTED_ATTESTATION_PATH = TRUSTED_ATTESTATION_SEGMENTS.join("/");
+
+// trustedBaseDir exists only so hermetic tests can stage a synthetic trusted
+// checkout; the CLI never forwards an argument for it, so production always
+// resolves against the workflow working directory that contains `trusted/`.
+function assertTrustedAttestationFile(file, trustedBaseDir) {
   nonEmptyString(file, "attestation path");
+  if (file.includes("\\")) {
+    fail("parent attestation path must not contain backslashes");
+  }
+  if (path.isAbsolute(file) || path.posix.isAbsolute(file)) {
+    fail("parent attestation path must be relative to the trusted checkout, not absolute");
+  }
   const segments = file.split("/");
-  if (segments.includes("..")) {
-    fail("parent attestation path must not traverse directories");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    fail("parent attestation path must be normalized without empty, dot or dot-dot components");
   }
-  if (segments.includes("source")) {
-    fail(
-      "parent attestation must be read from the trusted base checkout, not the untrusted source checkout",
-    );
+  if (file !== TRUSTED_ATTESTATION_PATH) {
+    fail(`parent attestation path must be exactly ${TRUSTED_ATTESTATION_PATH}`);
   }
-  if (!file.includes("ci/openclaw/attestations/")) {
-    fail("parent attestation must live in the trusted attestation directory");
+  if (path.posix.normalize(file) !== file) {
+    fail("parent attestation path changes identity under normalization");
   }
-  let stats;
-  try {
-    stats = fs.lstatSync(file);
-  } catch {
-    fail("parent attestation file is missing");
+  // Walk every component from the trusted checkout root to the leaf; a
+  // symlink anywhere on that chain could swap the governed file for
+  // attacker-chosen bytes after the lexical checks.
+  let current = trustedBaseDir;
+  for (const segment of TRUSTED_ATTESTATION_SEGMENTS) {
+    current = path.join(current, segment);
+    let stats;
+    try {
+      stats = fs.lstatSync(current);
+    } catch {
+      fail("parent attestation file is missing");
+    }
+    if (stats.isSymbolicLink()) {
+      fail(`parent attestation path component must not be a symbolic link: ${segment}`);
+    }
   }
-  if (!stats.isFile()) {
-    fail("parent attestation must be a regular file, not a symlink");
+  if (!fs.lstatSync(current).isFile()) {
+    fail("parent attestation must be a regular file");
   }
+  const expectedDirectory = fs.realpathSync(
+    path.join(trustedBaseDir, ...TRUSTED_ATTESTATION_SEGMENTS.slice(0, -1)),
+  );
+  const resolvedDirectory = fs.realpathSync(path.dirname(current));
+  if (resolvedDirectory !== expectedDirectory) {
+    fail("parent attestation directory escapes the trusted checkout");
+  }
+  const resolvedFile = fs.realpathSync(current);
+  if (resolvedFile !== path.join(expectedDirectory, TRUSTED_ATTESTATION_SEGMENTS.at(-1))) {
+    fail("parent attestation file escapes the trusted checkout");
+  }
+  return current;
+}
+
+export function readParentAttestation(file, manifest, trustedBaseDir = process.cwd()) {
+  const attestationFile = assertTrustedAttestationFile(file, trustedBaseDir);
   let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    parsed = JSON.parse(fs.readFileSync(attestationFile, "utf8"));
   } catch (error) {
     fail(`parent attestation is not valid JSON: ${error.message}`);
   }
@@ -496,10 +541,15 @@ function sha256Bytes(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-export function verifyContractReferences(manifest, sourceDir, attestationFile) {
+export function verifyContractReferences(
+  manifest,
+  sourceDir,
+  attestationFile,
+  trustedBaseDir = process.cwd(),
+) {
   // Parent: trusted digest attestation only. Child: exact bytes from the PR
   // source Git history, byte-verified on every run.
-  const parentEvidence = readParentAttestation(attestationFile, manifest);
+  const parentEvidence = readParentAttestation(attestationFile, manifest, trustedBaseDir);
 
   const childSpec = `${manifest.child_contract.commit_sha}:${manifest.child_contract.path}`;
   const childBytes = runGit(sourceDir, ["show", childSpec], { encoding: "buffer" });
@@ -587,10 +637,17 @@ export function validateWorkflowText(text) {
       fail(`cross-repository checkout is prohibited: ${match[1]}`);
     }
   }
-  for (const match of text.matchAll(/^[ \t]+([A-Z][A-Z0-9_]*)[ \t]*:/gm)) {
-    const key = match[1];
-    if (/TOKEN|SECRET|PASSWORD|CREDENTIAL/.test(key) || /(?:^|_)PAT(?:_|$)/.test(key)) {
-      fail(`credential-shaped environment name is prohibited: ${key}`);
+  // Underscore-style keys only: hyphenated YAML keywords such as
+  // persist-credentials never reach this check, and matching is done on the
+  // uppercased key so lowercase env names cannot bypass it.
+  for (const match of text.matchAll(/^[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*:/gm)) {
+    const key = match[1].toUpperCase();
+    if (
+      /TOKEN|SECRET|PASSWORD|CREDENTIAL/.test(key) ||
+      /(?:^|_)PAT(?:_|$)/.test(key) ||
+      /PRIVATE_?KEY/.test(key)
+    ) {
+      fail(`credential-shaped environment name is prohibited: ${match[1]}`);
     }
   }
   for (const match of text.matchAll(/--parent-attestation[ \t]+(\S+)/g)) {

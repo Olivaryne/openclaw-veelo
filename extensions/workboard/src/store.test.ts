@@ -5,6 +5,8 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { MAX_DATE_TIMESTAMP_MS } from "openclaw/plugin-sdk/number-runtime";
 import { describe, expect, it, vi } from "vitest";
+import type { OpenClawPluginApi } from "../api.js";
+import { registerWorkboardGatewayMethods } from "./gateway.js";
 import { createWorkboardSqliteStores } from "./sqlite-store.js";
 import {
   WorkboardStore,
@@ -2750,7 +2752,7 @@ import {
   isAtomicCorrelationKey,
   validateAtomicCreateRequest,
 } from "./store.js";
-import type { CanonicalAutomationCardSpecV1 } from "./types.js";
+import type { AtomicCreateResponseV1, CanonicalAutomationCardSpecV1 } from "./types.js";
 
 const FROZEN_KEY = "occ_v1_7a80f585e84b83e031d3eb8823faaee0";
 const FROZEN_FINGERPRINT =
@@ -2826,6 +2828,76 @@ function openAtomicFixture() {
   };
 }
 
+type AtomicGatewayHandler = Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1];
+
+function captureAtomicGatewayHandler(store: WorkboardStore): AtomicGatewayHandler {
+  const methods = new Map<string, AtomicGatewayHandler>();
+  const api = {
+    registerGatewayMethod: vi.fn((method: string, handler: AtomicGatewayHandler) => {
+      methods.set(method, handler);
+    }),
+  } as unknown as OpenClawPluginApi;
+  registerWorkboardGatewayMethods({ api, store });
+  const handler = methods.get("workboard.cards.createOrRecoverByCorrelationKey");
+  expect(handler).toBeDefined();
+  return handler as AtomicGatewayHandler;
+}
+
+async function invokeAtomicGateway(
+  handler: AtomicGatewayHandler,
+  params: Record<string, unknown>,
+): Promise<AtomicCreateResponseV1> {
+  const respond = vi.fn();
+  await handler({ params, respond } as never);
+  expect(respond).toHaveBeenCalledOnce();
+  expect(respond.mock.calls[0]?.[0]).toBe(true);
+  return respond.mock.calls[0]?.[1] as AtomicCreateResponseV1;
+}
+
+const PROHIBITED_ATOMIC_EFFECT_METHODS = [
+  "list",
+  "get",
+  "create",
+  "update",
+  "bulkUpdate",
+  "move",
+  "delete",
+  "claim",
+  "heartbeat",
+  "releaseClaim",
+  "promote",
+  "promoteReady",
+  "reassign",
+  "reclaim",
+  "complete",
+  "block",
+  "unblock",
+  "dispatch",
+] as const;
+
+function poisonProhibitedAtomicEffects(store: WorkboardStore) {
+  return PROHIBITED_ATOMIC_EFFECT_METHODS.map((method) =>
+    vi
+      .spyOn(store as unknown as Record<string, (...args: never[]) => unknown>, method)
+      .mockImplementation(() => {
+        throw new Error(`prohibited atomic effect reached: ${method}`);
+      }),
+  );
+}
+
+function poisonGenericStoreFallbacks(store: {
+  register: (...args: never[]) => unknown;
+  lookup: (...args: never[]) => unknown;
+  delete: (...args: never[]) => unknown;
+  entries: (...args: never[]) => unknown;
+}) {
+  return (["register", "lookup", "delete", "entries"] as const).map((method) =>
+    vi.spyOn(store, method).mockImplementation(() => {
+      throw new Error(`generic store fallback reached: ${method}`);
+    }),
+  );
+}
+
 // Full no-mutation oracle: the card row plus EVERY child-data surface (all twelve
 // child tables) and attachment blob bytes.
 const RAW_DIGEST_CHILD_TABLES = [
@@ -2876,6 +2948,18 @@ function receiptCount(dbPath: string, key: string): number {
         "SELECT COUNT(*) AS n FROM workboard_atomic_create_receipts WHERE correlation_key = ?",
       )
       .get(key) as { n: number | bigint };
+    return Number(row.n);
+  } finally {
+    db.close();
+  }
+}
+
+function totalReceiptCount(dbPath: string): number {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db.prepare("SELECT COUNT(*) AS n FROM workboard_atomic_create_receipts").get() as {
+      n: number | bigint;
+    };
     return Number(row.n);
   } finally {
     db.close();
@@ -3113,6 +3197,182 @@ describe("AUT-WB-ATOMIC request validation (A14-A22)", () => {
     const tokenShape = ["ghp", "A".repeat(20)].join("_");
     secretClone.board.template_ref = `workboard:template/${tokenShape}`;
     expectInvalid(key, secretClone, key);
+  });
+});
+
+describe("AUT-WB-ATOMIC A22 closed-request persisted-invariant proof", () => {
+  type A22Case = {
+    label: string;
+    expectedCorrelationKey: string | null;
+    params: (key: string, spec: CanonicalAutomationCardSpecV1) => Record<string, unknown>;
+  };
+
+  function mutatedSpec(
+    spec: CanonicalAutomationCardSpecV1,
+    mutate: (clone: Record<string, any>) => void,
+  ): Record<string, unknown> {
+    const clone = structuredClone(spec) as Record<string, any>;
+    mutate(clone);
+    return clone;
+  }
+
+  it("rejects unknown and missing fields at every request/spec authority level before lookup or write", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(created.reason_code).toBe("workboard_card_created");
+      const cardId = created.card?.id as string;
+      const handler = captureAtomicGatewayHandler(fixture.store);
+      const invariantBefore = rawDigest(fixture.dbPath, cardId);
+      const receiptsBefore = totalReceiptCount(fixture.dbPath);
+      const atomicBoundarySpy = vi.spyOn(
+        fixture.stores.cards as unknown as {
+          atomicCreateOrRecover: (...args: never[]) => unknown;
+        },
+        "atomicCreateOrRecover",
+      );
+      const effectSpies = poisonProhibitedAtomicEffects(fixture.store);
+      const fallbackSpies = poisonGenericStoreFallbacks(fixture.stores.cards);
+      const cases: A22Case[] = [
+        {
+          label: "unknown top-level request field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: requestSpec,
+            unknown_request_field: true,
+          }),
+        },
+        {
+          label: "missing top-level correlationKey",
+          expectedCorrelationKey: null,
+          params: (_requestKey, requestSpec) => ({ cardSpec: requestSpec }),
+        },
+        {
+          label: "missing top-level cardSpec",
+          expectedCorrelationKey: key,
+          params: (requestKey) => ({ correlationKey: requestKey }),
+        },
+        {
+          label: "unknown cardSpec field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.unknown_spec_field = true;
+            }),
+          }),
+        },
+        {
+          label: "missing required cardSpec field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              delete clone.priority;
+            }),
+          }),
+        },
+        {
+          label: "unknown automation identity field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.automation.unknown_identity_field = true;
+            }),
+          }),
+        },
+        {
+          label: "missing required automation identity field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              delete clone.automation.automation_id;
+            }),
+          }),
+        },
+        {
+          label: "unknown board field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.board.unknown_board_field = true;
+            }),
+          }),
+        },
+        {
+          label: "missing required board field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              delete clone.board.template_ref;
+            }),
+          }),
+        },
+        {
+          label: "unknown execution_control field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.execution_control.unknown_execution_field = true;
+            }),
+          }),
+        },
+        {
+          label: "missing required execution_control field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              delete clone.execution_control.execution_authorized;
+            }),
+          }),
+        },
+        {
+          label: "unknown nested governance field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.automation.governance = { unknown_governance_field: true };
+            }),
+          }),
+        },
+      ];
+
+      for (const testCase of cases) {
+        const result = await invokeAtomicGateway(handler, testCase.params(key, spec));
+        expect(result, testCase.label).toEqual({
+          schema_version: 1,
+          ok: false,
+          outcome: "refused",
+          reason_code: "workboard_create_request_invalid",
+          retryable: false,
+          correlation_key: testCase.expectedCorrelationKey,
+          card: null,
+          stored_spec: null,
+          stored_fingerprint: null,
+          evidence: null,
+        });
+        expect(rawDigest(fixture.dbPath, cardId), testCase.label).toBe(invariantBefore);
+        expect(totalReceiptCount(fixture.dbPath), testCase.label).toBe(receiptsBefore);
+      }
+
+      expect(atomicBoundarySpy).not.toHaveBeenCalled();
+      for (const spy of [...effectSpies, ...fallbackSpies]) {
+        expect(spy).not.toHaveBeenCalled();
+        spy.mockRestore();
+      }
+    } finally {
+      vi.restoreAllMocks();
+      fixture.close();
+    }
   });
 });
 
@@ -3695,6 +3955,145 @@ describe("AUT-WB-ATOMIC recovery, conflicts, and refusals", () => {
   });
 });
 
+describe("AUT-WB-ATOMIC A25 persisted unknown-field proof", () => {
+  const cases: Array<{
+    label: string;
+    addUnknownField: (spec: Record<string, any>) => void;
+  }> = [
+    {
+      label: "root governance object",
+      addUnknownField: (spec) => {
+        spec.unknown_root_governance = true;
+      },
+    },
+    {
+      label: "automation governance object",
+      addUnknownField: (spec) => {
+        spec.automation.unknown_automation_governance = true;
+      },
+    },
+    {
+      label: "board authority object",
+      addUnknownField: (spec) => {
+        spec.board.unknown_board_governance = true;
+      },
+    },
+    {
+      label: "execution_control authority object",
+      addUnknownField: (spec) => {
+        spec.execution_control.unknown_execution_governance = true;
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(`${testCase.label}: returns exact stored-invalid evidence and preserves corrupt bytes plus every child surface`, async () => {
+      const fixture = openAtomicFixture();
+      try {
+        const { key, spec } = makeAtomicSpec();
+        const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(created.reason_code).toBe("workboard_card_created");
+        const cardId = created.card?.id as string;
+        const requestedFingerprint = created.stored_fingerprint as string;
+        corruptCorrelatedRow(fixture.dbPath, (db) => {
+          const row = db
+            .prepare("SELECT governance_spec_json FROM workboard_cards WHERE id = ?")
+            .get(cardId) as { governance_spec_json: string };
+          const persistedSpec = JSON.parse(row.governance_spec_json) as Record<string, any>;
+          testCase.addUnknownField(persistedSpec);
+          db.prepare("UPDATE workboard_cards SET governance_spec_json = ? WHERE id = ?").run(
+            JSON.stringify(persistedSpec),
+            cardId,
+          );
+        });
+        const corruptRowBefore = new DatabaseSync(fixture.dbPath);
+        const persistedBefore = corruptRowBefore
+          .prepare(
+            "SELECT governance_spec_json, governance_fingerprint FROM workboard_cards WHERE id = ?",
+          )
+          .get(cardId) as {
+          governance_spec_json: string;
+          governance_fingerprint: string;
+        };
+        corruptRowBefore.close();
+        expect(persistedBefore.governance_fingerprint).toBe(requestedFingerprint);
+        const invariantBefore = rawDigest(fixture.dbPath, cardId);
+        const receiptsBefore = receiptCount(fixture.dbPath, key);
+        const effectSpies = poisonProhibitedAtomicEffects(fixture.store);
+        const fallbackSpies = poisonGenericStoreFallbacks(fixture.stores.cards);
+
+        const result = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(result).toEqual({
+          schema_version: 1,
+          ok: false,
+          outcome: "refused",
+          reason_code: "workboard_stored_record_invalid",
+          retryable: false,
+          correlation_key: key,
+          card: null,
+          stored_spec: null,
+          stored_fingerprint: null,
+          evidence: {
+            kind: "workboard_atomic_receipt",
+            ref: expect.stringMatching(
+              /^workboard:atomic-create-receipt\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+            ),
+          },
+        });
+        const receiptId = result.evidence?.ref.split("/").pop() as string;
+        const lookup = await fixture.store.getAtomicCreateReceipt(receiptId);
+        expect(lookup.schema_version).toBe(1);
+        expect(Object.keys(lookup.receipt ?? {}).toSorted()).toEqual([
+          "card_id",
+          "correlation_key",
+          "created_at",
+          "detail_code",
+          "id",
+          "outcome",
+          "reason_code",
+          "request_fingerprint",
+          "schema_version",
+          "stored_fingerprint",
+        ]);
+        expect(lookup.receipt).toEqual({
+          schema_version: 1,
+          id: receiptId,
+          correlation_key: key,
+          card_id: cardId,
+          request_fingerprint: requestedFingerprint,
+          stored_fingerprint: requestedFingerprint,
+          outcome: "refused",
+          reason_code: "workboard_stored_record_invalid",
+          detail_code: "governance-spec-invalid",
+          created_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+        });
+        expect(lookup.receipt).not.toHaveProperty("request_id");
+        expect(lookup.receipt).not.toHaveProperty("retryable");
+        expect(rawDigest(fixture.dbPath, cardId)).toBe(invariantBefore);
+        expect(receiptCount(fixture.dbPath, key)).toBe(receiptsBefore + 1);
+        const corruptRowAfter = new DatabaseSync(fixture.dbPath);
+        const persistedAfter = corruptRowAfter
+          .prepare(
+            "SELECT governance_spec_json, governance_fingerprint FROM workboard_cards WHERE id = ?",
+          )
+          .get(cardId) as {
+          governance_spec_json: string;
+          governance_fingerprint: string;
+        };
+        corruptRowAfter.close();
+        expect(persistedAfter).toEqual(persistedBefore);
+        for (const spy of [...effectSpies, ...fallbackSpies]) {
+          expect(spy).not.toHaveBeenCalled();
+          spy.mockRestore();
+        }
+      } finally {
+        vi.restoreAllMocks();
+        fixture.close();
+      }
+    });
+  }
+});
+
 describe("AUT-WB-ATOMIC no execution surface (A37)", () => {
   it("static: the atomic modules never import dispatcher or subagent surfaces", () => {
     const here = path.dirname(new URL(import.meta.url).pathname);
@@ -3716,6 +4115,7 @@ describe("AUT-WB-ATOMIC no execution surface (A37)", () => {
       "complete",
       "block",
       "unblock",
+      "dispatch",
       "move",
       "create",
       "update",

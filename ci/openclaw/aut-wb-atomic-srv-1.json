@@ -1,0 +1,133 @@
+{
+  "schema_version": "openclaw-ci-target/1",
+  "target_id": "AUT-WB-ATOMIC-SRV-1",
+  "repository": "Olivaryne/openclaw-veelo",
+  "pull_request_number": 3,
+  "base_branch": "veelo-main",
+  "implementation_branch": "feat/aut-wb-atomic-srv-1",
+  "implementation_base_sha": "ff2131e587645d473d3328831e42a50e3529ed38",
+  "parent_contract": {
+    "repository": "Olivaryne/veelo",
+    "path": "docs/architecture/aut-wb-atomic-create-or-recover-contract.md",
+    "commit_sha": "4233aab48219f17f3a8d9ad7d2018c9fc95b93a6",
+    "sha256": "c3680fa42c1df3cd156cc57a44230c2cb3f3628a3670d1b2774cc2804c9654e4"
+  },
+  "child_contract": {
+    "repository": "Olivaryne/openclaw-veelo",
+    "path": "contracts/automation/aut-wb-atomic-server.v1.md",
+    "commit_sha": "18ac73a0d31bc0dcf26294de72050af0b4031d29",
+    "sha256": "c8636540022d41233cc13c7a964322a00652797642055bbbb5112f2c17cab269"
+  },
+  "permitted_files": {
+    "production": [
+      "extensions/workboard/src/gateway.ts",
+      "extensions/workboard/src/sqlite-store.ts",
+      "extensions/workboard/src/store.ts",
+      "extensions/workboard/src/types.ts"
+    ],
+    "tests": [
+      "extensions/workboard/src/gateway.test.ts",
+      "extensions/workboard/src/sqlite-store.test.ts",
+      "extensions/workboard/src/store.test.ts"
+    ]
+  },
+  "prohibited_path_classes": [
+    {
+      "class": "dependency",
+      "exact": [
+        "bun.lock",
+        "bun.lockb",
+        "npm-shrinkwrap.json",
+        "package-lock.json",
+        "package.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "yarn.lock"
+      ],
+      "prefixes": [],
+      "suffixes": [
+        "/package-lock.json",
+        "/package.json",
+        "/pnpm-lock.yaml",
+        "/yarn.lock"
+      ],
+      "segments": []
+    },
+    {
+      "class": "workflow",
+      "exact": [],
+      "prefixes": [
+        ".github/actions/",
+        ".github/workflows/"
+      ],
+      "suffixes": [],
+      "segments": []
+    },
+    {
+      "class": "deployment",
+      "exact": [],
+      "prefixes": [
+        "deploy/",
+        "deployments/",
+        "infra/"
+      ],
+      "suffixes": [],
+      "segments": []
+    },
+    {
+      "class": "generated",
+      "exact": [],
+      "prefixes": [
+        "build/",
+        "coverage/",
+        "dist/"
+      ],
+      "suffixes": [],
+      "segments": [
+        "build",
+        "coverage",
+        "dist"
+      ]
+    },
+    {
+      "class": "secret-bearing",
+      "exact": [
+        ".env",
+        ".npmrc"
+      ],
+      "prefixes": [],
+      "suffixes": [
+        ".env",
+        ".key",
+        ".p12",
+        ".pem"
+      ],
+      "segments": [
+        "credentials",
+        "secrets"
+      ]
+    }
+  ],
+  "required_focused_commands": [
+    "node scripts/run-vitest.mjs extensions/workboard"
+  ],
+  "required_blast_radius_commands": [
+    "corepack pnpm tsgo",
+    "corepack pnpm tsgo:extensions",
+    "corepack pnpm tsgo:extensions:test",
+    "corepack pnpm build",
+    "node scripts/run-oxlint.mjs extensions/workboard/src/gateway.test.ts extensions/workboard/src/gateway.ts extensions/workboard/src/sqlite-store.test.ts extensions/workboard/src/sqlite-store.ts extensions/workboard/src/store.test.ts extensions/workboard/src/store.ts extensions/workboard/src/types.ts",
+    "corepack pnpm exec oxfmt --check extensions/workboard/src/gateway.test.ts extensions/workboard/src/gateway.ts extensions/workboard/src/sqlite-store.test.ts extensions/workboard/src/sqlite-store.ts extensions/workboard/src/store.test.ts extensions/workboard/src/store.ts extensions/workboard/src/types.ts",
+    "corepack pnpm check:import-cycles",
+    "node scripts/run-vitest.mjs src/agents/worktrees/registry.test.ts src/agents/worktrees/service.test.ts src/gateway/server-methods.authorization.test.ts src/gateway/server-plugins.test.ts src/plugins/bundled-plugin-metadata.test.ts src/plugins/contracts/boundary-invariants.test.ts src/plugins/contracts/plugin-sdk-runtime-api-guardrails.test.ts test/scripts/plugin-gateway-gauntlet.test.ts",
+    "node trusted/scripts/ci/openclaw-ci.mjs compare-audit --base trusted --head source"
+  ],
+  "rollback_package": {
+    "name": "openclaw",
+    "version": "2026.7.1-2",
+    "registry": "https://registry.npmjs.org",
+    "fixture_test_pattern": "2026.7.1-2 bundle"
+  },
+  "rollback_fixture_must_run": true,
+  "receipt_schema_version": "openclaw-ci-receipt/1"
+}

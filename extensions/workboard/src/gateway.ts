@@ -2,7 +2,7 @@
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { OpenClawPluginApi } from "../api.js";
 import { dispatchAndStartWorkboardCards } from "./dispatcher.js";
-import { WorkboardStore } from "./store.js";
+import { buildAtomicEnvelope, isAtomicCorrelationKey, WorkboardStore } from "./store.js";
 import { WORKBOARD_STATUSES, type WorkboardCard } from "./types.js";
 
 const READ_SCOPE = "operator.read" as const;
@@ -701,4 +701,58 @@ export function registerWorkboardGatewayMethods(params: {
     },
     { scope: READ_SCOPE },
   );
+
+  // AUT-WB-ATOMIC boundary (contract aut-wb-atomic/1 §2.1, §8.1). The two methods
+  // register only after the store proves the completed schema-3 migration (§6.2 step
+  // 10); a store without the SQLite atomic authority exposes no atomic surface and
+  // no fallback to generic create exists on any path.
+  if (store.supportsAtomicCreate()) {
+    api.registerGatewayMethod(
+      "workboard.cards.createOrRecoverByCorrelationKey",
+      async ({ params: requestParams, respond }) => {
+        const paramKeys = Object.keys(requestParams ?? {});
+        const closedRequest =
+          paramKeys.length === 2 &&
+          paramKeys.includes("correlationKey") &&
+          paramKeys.includes("cardSpec");
+        const requestKey = isAtomicCorrelationKey(requestParams?.correlationKey)
+          ? requestParams.correlationKey
+          : null;
+        if (!closedRequest) {
+          respond(true, buildAtomicEnvelope("workboard_create_request_invalid", requestKey));
+          return;
+        }
+        try {
+          respond(
+            true,
+            await store.createOrRecoverByCorrelationKey(
+              requestParams.correlationKey,
+              requestParams.cardSpec,
+            ),
+          );
+        } catch {
+          // The store method returns typed envelopes for every classified failure;
+          // anything escaping it leaves the commit status unknowable (§4.2).
+          respond(true, buildAtomicEnvelope("workboard_result_uncertain", requestKey));
+        }
+      },
+      { scope: WRITE_SCOPE },
+    );
+
+    api.registerGatewayMethod(
+      "workboard.atomicCreateReceipts.get",
+      async ({ params: requestParams, respond }) => {
+        try {
+          const paramKeys = Object.keys(requestParams ?? {});
+          if (paramKeys.length !== 1 || paramKeys[0] !== "id") {
+            throw new Error("atomic receipt lookup accepts exactly {id}.");
+          }
+          respond(true, await store.getAtomicCreateReceipt(requestParams.id));
+        } catch (error) {
+          respondError(respond, error);
+        }
+      },
+      { scope: READ_SCOPE },
+    );
+  }
 }

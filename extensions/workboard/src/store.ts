@@ -2742,6 +2742,12 @@ export function judgeAtomicStoredRow(
   if (revalidated.fingerprint !== storedFingerprint) {
     return storedInvalid("governance-fingerprint-forged");
   }
+  // The stored authority is the frozen canonical byte string, not merely a
+  // semantically equivalent JSON document: non-canonical persisted bytes are
+  // stored-record invalidity and are never normalized, rewritten, or recovered.
+  if (row.governanceSpecJson !== revalidated.canonicalJson) {
+    return storedInvalid("governance-spec-noncanonical");
+  }
   const storedSpec = revalidated.spec;
   const state = (detailCode: string) =>
     ({
@@ -2770,6 +2776,35 @@ export function judgeAtomicStoredRow(
   }
   if (row.executionId !== null) {
     return state("card-executing");
+  }
+  // Every persisted execution field must be null before recovery (parent invariant
+  // 13 and the §5 pristine-state definition) - each is checked independently.
+  if (row.executionKind !== null) {
+    return state("execution-kind-set");
+  }
+  if (row.executionEngine !== null) {
+    return state("execution-engine-set");
+  }
+  if (row.executionMode !== null) {
+    return state("execution-mode-set");
+  }
+  if (row.executionStatus !== null) {
+    return state("execution-status-set");
+  }
+  if (row.executionModel !== null) {
+    return state("execution-model-set");
+  }
+  if (row.executionSessionKey !== null) {
+    return state("execution-session-key-set");
+  }
+  if (row.executionRunId !== null) {
+    return state("execution-run-id-set");
+  }
+  if (row.executionStartedAt !== null) {
+    return state("execution-started-at-set");
+  }
+  if (row.executionUpdatedAt !== null) {
+    return state("execution-updated-at-set");
   }
   if (row.startedAt !== null) {
     return state("card-started");
@@ -2855,7 +2890,116 @@ export function buildAtomicEnvelope(
   };
 }
 
+// Closed detail-code universe the server ever writes. Lookup refuses anything else:
+// receipts are an authority surface, not a cast-through.
+const ATOMIC_RECEIPT_DETAIL_CODES = new Set([
+  "governance-spec-version-invalid",
+  "governance-fingerprint-unreadable",
+  "governance-spec-missing",
+  "governance-spec-unreadable",
+  "governance-spec-invalid",
+  "governance-spec-noncanonical",
+  "correlation-key-mismatch",
+  "governance-fingerprint-forged",
+  "card-archived",
+  "status-not-backlog",
+  "priority-drift",
+  "card-assigned",
+  "card-claimed",
+  "card-executing",
+  "execution-kind-set",
+  "execution-engine-set",
+  "execution-mode-set",
+  "execution-status-set",
+  "execution-model-set",
+  "execution-session-key-set",
+  "execution-run-id-set",
+  "execution-started-at-set",
+  "execution-updated-at-set",
+  "card-started",
+  "card-completed",
+  "card-has-attempts",
+  "labels-drift",
+  "title-drift",
+  "notes-drift",
+  "board-drift",
+  "legacy-metadata-malformed",
+  "indexed-legacy-mismatch",
+]);
+const ATOMIC_LEGACY_CANDIDATES_DETAIL_RE = /^legacy-candidates-[1-9][0-9]{0,9}$/;
+
+// The six receipt-durable reason codes with their frozen outcome (contract §4.3).
+const ATOMIC_RECEIPT_REASON_OUTCOMES: Record<string, string> = {
+  workboard_card_created: "created",
+  workboard_card_recovered: "recovered",
+  workboard_card_conflict: "refused",
+  workboard_stored_record_invalid: "refused",
+  workboard_card_state_incompatible: "refused",
+  workboard_incompatible_legacy_card: "refused",
+};
+
+// Closed validation of a persisted receipt row before it may leave the boundary as
+// AtomicCreateReceiptV1. A malformed persisted receipt is rejected, never cast.
 function atomicReceiptProjection(row: WorkboardAtomicReceiptRow): AtomicCreateReceiptV1 {
+  const refuse = (field: string): never => {
+    throw new Error(`workboard atomic receipt failed closed validation: ${field}`);
+  };
+  if (!ATOMIC_UUID_RE.test(row.id)) {
+    refuse("id");
+  }
+  if (!ATOMIC_KEY_RE.test(row.correlationKey)) {
+    refuse("correlation_key");
+  }
+  if (!ATOMIC_FINGERPRINT_RE.test(row.requestFingerprint)) {
+    refuse("request_fingerprint");
+  }
+  if (row.storedFingerprint !== null && !ATOMIC_FINGERPRINT_RE.test(row.storedFingerprint)) {
+    refuse("stored_fingerprint");
+  }
+  if (row.cardId !== null && !ATOMIC_UUID_RE.test(row.cardId)) {
+    refuse("card_id");
+  }
+  const expectedOutcome = ATOMIC_RECEIPT_REASON_OUTCOMES[row.reasonCode];
+  if (expectedOutcome === undefined || row.outcome !== expectedOutcome) {
+    refuse("reason_code/outcome");
+  }
+  const reason = row.reasonCode;
+  const cardIdRequired =
+    reason === "workboard_card_created" ||
+    reason === "workboard_card_recovered" ||
+    reason === "workboard_card_conflict" ||
+    reason === "workboard_card_state_incompatible";
+  if (cardIdRequired && row.cardId === null) {
+    refuse("card_id-null");
+  }
+  if (cardIdRequired && row.storedFingerprint === null) {
+    refuse("stored_fingerprint-null");
+  }
+  if (reason === "workboard_incompatible_legacy_card" && row.storedFingerprint !== null) {
+    refuse("stored_fingerprint-forbidden");
+  }
+  const detailForbidden =
+    reason === "workboard_card_created" ||
+    reason === "workboard_card_recovered" ||
+    reason === "workboard_card_conflict";
+  if (detailForbidden && row.detailCode !== null) {
+    refuse("detail_code-forbidden");
+  }
+  const detailRequired =
+    reason === "workboard_card_state_incompatible" || reason === "workboard_stored_record_invalid";
+  if (detailRequired && row.detailCode === null) {
+    refuse("detail_code-null");
+  }
+  if (
+    row.detailCode !== null &&
+    !ATOMIC_RECEIPT_DETAIL_CODES.has(row.detailCode) &&
+    !ATOMIC_LEGACY_CANDIDATES_DETAIL_RE.test(row.detailCode)
+  ) {
+    refuse("detail_code");
+  }
+  if (!Number.isSafeInteger(row.createdAt) || row.createdAt <= 0) {
+    refuse("created_at");
+  }
   return {
     schema_version: 1,
     id: row.id,

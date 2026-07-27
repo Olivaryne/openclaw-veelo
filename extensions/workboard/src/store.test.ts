@@ -2826,20 +2826,41 @@ function openAtomicFixture() {
   };
 }
 
+// Full no-mutation oracle: the card row plus EVERY child-data surface (all twelve
+// child tables) and attachment blob bytes.
+const RAW_DIGEST_CHILD_TABLES = [
+  "workboard_card_labels",
+  "workboard_card_events",
+  "workboard_card_attempts",
+  "workboard_card_comments",
+  "workboard_card_links",
+  "workboard_card_proof",
+  "workboard_card_artifacts",
+  "workboard_card_attachments",
+  "workboard_card_diagnostics",
+  "workboard_card_notifications",
+  "workboard_worker_logs",
+  "workboard_worker_protocol",
+] as const;
+
 function rawDigest(dbPath: string, cardId: string): string {
   const db = new DatabaseSync(dbPath);
   try {
     const card = db.prepare("SELECT * FROM workboard_cards WHERE id = ?").get(cardId);
-    const labels = db
-      .prepare("SELECT * FROM workboard_card_labels WHERE card_id = ? ORDER BY ordinal")
+    const children = RAW_DIGEST_CHILD_TABLES.map((table) =>
+      db.prepare(`SELECT * FROM ${table} WHERE card_id = ? ORDER BY rowid`).all(cardId),
+    );
+    const attachmentBlobs = db
+      .prepare(
+        `
+          SELECT a.id AS attachment_id, hex(b.content) AS content_hex
+          FROM workboard_card_attachments a
+          JOIN workboard_attachment_blobs b ON b.attachment_id = a.id
+          WHERE a.card_id = ? ORDER BY a.id
+        `,
+      )
       .all(cardId);
-    const events = db
-      .prepare("SELECT * FROM workboard_card_events WHERE card_id = ? ORDER BY ordinal")
-      .all(cardId);
-    const attempts = db
-      .prepare("SELECT * FROM workboard_card_attempts WHERE card_id = ? ORDER BY ordinal")
-      .all(cardId);
-    return JSON.stringify({ card, labels, events, attempts }, (_key, value) =>
+    return JSON.stringify({ card, children, attachmentBlobs }, (_key, value) =>
       typeof value === "bigint" ? Number(value) : value,
     );
   } finally {
@@ -3262,6 +3283,24 @@ describe("AUT-WB-ATOMIC recovery, conflicts, and refusals", () => {
         },
       },
       {
+        // A25 nested variant (Round-1 proof gap 3): the unknown field hides one
+        // level down, inside the automation object.
+        detail: "governance-spec-invalid",
+        corrupt: (db, cardId) => {
+          const row = db
+            .prepare("SELECT governance_spec_json FROM workboard_cards WHERE id = ?")
+            .get(cardId) as { governance_spec_json: string };
+          const spec = JSON.parse(row.governance_spec_json) as {
+            automation: Record<string, unknown>;
+          };
+          spec.automation.unknown_nested = "x";
+          db.prepare("UPDATE workboard_cards SET governance_spec_json = ? WHERE id = ?").run(
+            JSON.stringify(spec),
+            cardId,
+          );
+        },
+      },
+      {
         detail: "governance-fingerprint-forged",
         corrupt: (db, cardId) =>
           void db
@@ -3345,6 +3384,71 @@ describe("AUT-WB-ATOMIC recovery, conflicts, and refusals", () => {
         mutate: (db, id) =>
           void db
             .prepare("UPDATE workboard_cards SET execution_id = 'exec-1' WHERE id = ?")
+            .run(id),
+      },
+      // Every persisted execution field independently breaks pristine state
+      // (Round-1 defect 3), including the reviewer-reproduced execution_status case.
+      {
+        detail: "execution-kind-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_kind = 'agent-session' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-engine-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_engine = 'claude' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-mode-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_mode = 'autonomous' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-status-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_status = 'running' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-model-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_model = 'model-x' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-session-key-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_session_key = 'sess-1' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-run-id-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_run_id = 'run-1' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-started-at-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_started_at = 7 WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-updated-at-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_updated_at = 7 WHERE id = ?")
             .run(id),
       },
       {
@@ -3680,6 +3784,245 @@ describe("AUT-WB-ATOMIC no execution surface (A37)", () => {
         "stored_fingerprint",
         "stored_spec",
       ]);
+    }
+  });
+});
+
+describe("AUT-WB-ATOMIC canonical stored bytes (Round-1 defect 4)", () => {
+  // Rewrites the stored governance_spec_json to semantically equal but
+  // non-canonical bytes while leaving the (still fingerprint-consistent, since the
+  // fingerprint is computed over canonical bytes) stored fingerprint untouched.
+  const variants: Array<{ label: string; rewrite: (canonical: string) => string }> = [
+    {
+      label: "pretty-printed JSON",
+      rewrite: (canonical) => JSON.stringify(JSON.parse(canonical), null, 2),
+    },
+    {
+      label: "reordered keys",
+      rewrite: (canonical) => {
+        const reversedCanonical = (value: unknown): string => {
+          if (Array.isArray(value)) {
+            return `[${value.map((entry) => reversedCanonical(entry)).join(",")}]`;
+          }
+          if (value !== null && typeof value === "object") {
+            return `{${Object.keys(value as Record<string, unknown>)
+              .toSorted()
+              .toReversed()
+              .map(
+                (key) =>
+                  `${JSON.stringify(key)}:${reversedCanonical((value as Record<string, unknown>)[key])}`,
+              )
+              .join(",")}}`;
+          }
+          return JSON.stringify(value);
+        };
+        return reversedCanonical(JSON.parse(canonical));
+      },
+    },
+    {
+      label: "insignificant whitespace",
+      rewrite: (canonical) => `${canonical} `,
+    },
+  ];
+
+  for (const variant of variants) {
+    it(`${variant.label} with an unchanged stored fingerprint is stored-record invalid, not recovered`, async () => {
+      const fixture = openAtomicFixture();
+      try {
+        const { key, spec } = makeAtomicSpec();
+        const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(created.reason_code).toBe("workboard_card_created");
+        const cardId = created.card?.id as string;
+        corruptCorrelatedRow(fixture.dbPath, (db) => {
+          const row = db
+            .prepare(
+              "SELECT governance_spec_json, governance_fingerprint FROM workboard_cards WHERE id = ?",
+            )
+            .get(cardId) as { governance_spec_json: string; governance_fingerprint: string };
+          const rewritten = variant.rewrite(row.governance_spec_json);
+          expect(rewritten).not.toBe(row.governance_spec_json);
+          expect(JSON.parse(rewritten)).toEqual(JSON.parse(row.governance_spec_json));
+          db.prepare("UPDATE workboard_cards SET governance_spec_json = ? WHERE id = ?").run(
+            rewritten,
+            cardId,
+          );
+        });
+        const fingerprintAfter = new DatabaseSync(fixture.dbPath)
+          .prepare("SELECT governance_fingerprint AS fp FROM workboard_cards WHERE id = ?")
+          .get(cardId) as { fp: string };
+        expect(fingerprintAfter.fp).toBe(created.stored_fingerprint);
+        const before = rawDigest(fixture.dbPath, cardId);
+        const result = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(result.reason_code).toBe("workboard_stored_record_invalid");
+        expect(result.ok).toBe(false);
+        expect(result.card).toBeNull();
+        expect(result.stored_spec).toBeNull();
+        expect(result.evidence?.kind).toBe("workboard_atomic_receipt");
+        // Not normalized, rewritten, or recovered: bytes and full digest unchanged.
+        expect(rawDigest(fixture.dbPath, cardId)).toBe(before);
+        const db = new DatabaseSync(fixture.dbPath);
+        try {
+          const receipt = db
+            .prepare(
+              "SELECT detail_code FROM workboard_atomic_create_receipts WHERE reason_code = 'workboard_stored_record_invalid' ORDER BY created_at DESC LIMIT 1",
+            )
+            .get() as { detail_code: string };
+          expect(receipt.detail_code).toBe("governance-spec-noncanonical");
+        } finally {
+          db.close();
+        }
+      } finally {
+        fixture.close();
+      }
+    });
+  }
+
+  it("canonical stored bytes control: the untouched card still recovers", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      const recovered = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(recovered.reason_code).toBe("workboard_card_recovered");
+      expect(recovered.card?.id).toBe(created.card?.id);
+    } finally {
+      fixture.close();
+    }
+  });
+});
+
+describe("AUT-WB-ATOMIC closed receipt lookup validation (Round-1 defect 5)", () => {
+  type ReceiptRowFixture = {
+    id: string;
+    correlationKey: string;
+    cardId: string | null;
+    requestFingerprint: string;
+    storedFingerprint: string | null;
+    outcome: string;
+    reasonCode: string;
+    detailCode: string | null;
+    createdAt: number;
+  };
+  const VALID_ROW: ReceiptRowFixture = {
+    id: "99999999-9999-4999-8999-999999999999",
+    correlationKey: FROZEN_KEY,
+    cardId: "77777777-7777-4777-8777-777777777777",
+    requestFingerprint: FROZEN_FINGERPRINT,
+    storedFingerprint: FROZEN_FINGERPRINT,
+    outcome: "created",
+    reasonCode: "workboard_card_created",
+    detailCode: null,
+    createdAt: 5,
+  };
+
+  function storeWithReceiptRow(row: typeof VALID_ROW) {
+    // A minimal atomic-capable stub whose persisted receipt row is adversarial.
+    // This unit-tests the closed store-layer validation independently of the SQLite
+    // CHECK constraints (which are proven separately at the DDL boundary).
+    const capability = {
+      atomicCreateOrRecover: () => ({ kind: "uncertain" as const }),
+      getAtomicCreateReceipt: () => ({ ...row }),
+      isCorrelatedCard: () => false,
+      verifyAtomicMigrationComplete: () => true,
+    };
+    const memory = createMemoryStore();
+    return new WorkboardStore(Object.assign(memory, capability));
+  }
+
+  it("emits a valid persisted receipt as the closed envelope (control)", async () => {
+    const store = storeWithReceiptRow(VALID_ROW);
+    const lookup = await store.getAtomicCreateReceipt(VALID_ROW.id);
+    expect(lookup.receipt).toMatchObject({
+      schema_version: 1,
+      id: VALID_ROW.id,
+      correlation_key: FROZEN_KEY,
+      outcome: "created",
+      reason_code: "workboard_card_created",
+    });
+  });
+
+  it("rejects malformed persisted receipts instead of casting them", async () => {
+    const malformedRows: Array<Partial<typeof VALID_ROW>> = [
+      { correlationKey: FROZEN_KEY.toUpperCase() },
+      { correlationKey: "occ_v2_7a80f585e84b83e031d3eb8823faaee0" },
+      { requestFingerprint: `sha256:${"Z".repeat(64)}` },
+      { storedFingerprint: "sha1:abc" },
+      { cardId: null },
+      { cardId: "not-a-uuid" },
+      { detailCode: "Free form prose!" },
+      { detailCode: "not-in-the-closed-set" },
+      { outcome: "refused" },
+      { outcome: "created", reasonCode: "workboard_card_recovered" },
+      { reasonCode: "workboard_unavailable", outcome: "failed" },
+      { createdAt: 0 },
+      { createdAt: 1.5 },
+    ];
+    for (const overrides of malformedRows) {
+      const store = storeWithReceiptRow({ ...VALID_ROW, ...overrides });
+      await expect(
+        store.getAtomicCreateReceipt(VALID_ROW.id),
+        JSON.stringify(overrides),
+      ).rejects.toThrow(/receipt failed closed validation/);
+    }
+    // Nullable-combination rules are reason-scoped: a legacy refusal must not carry
+    // a stored fingerprint, and a state refusal must carry a detail code.
+    await expect(
+      storeWithReceiptRow({
+        ...VALID_ROW,
+        outcome: "refused",
+        reasonCode: "workboard_incompatible_legacy_card",
+        cardId: null,
+        storedFingerprint: FROZEN_FINGERPRINT,
+        detailCode: null,
+      }).getAtomicCreateReceipt(VALID_ROW.id),
+    ).rejects.toThrow(/receipt failed closed validation/);
+    await expect(
+      storeWithReceiptRow({
+        ...VALID_ROW,
+        outcome: "refused",
+        reasonCode: "workboard_card_state_incompatible",
+        detailCode: null,
+      }).getAtomicCreateReceipt(VALID_ROW.id),
+    ).rejects.toThrow(/receipt failed closed validation/);
+  });
+});
+
+describe("AUT-WB-ATOMIC escaped legacy key at the store boundary (Round-1 defect 2)", () => {
+  it("detects a JSON-escaped semantically equal legacy key and never creates beside it", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const escapedChar = `\\u00${key.charCodeAt(12).toString(16).padStart(2, "0")}`;
+      const escapedPayload = `{"idempotencyKey":"${key.slice(0, 12)}${escapedChar}${key.slice(13)}"}`;
+      expect(escapedPayload.includes(key)).toBe(false);
+      expect((JSON.parse(escapedPayload) as { idempotencyKey: string }).idempotencyKey).toBe(key);
+      const db = new DatabaseSync(fixture.dbPath);
+      db.prepare(
+        `
+          INSERT INTO workboard_cards
+            (id, board_id, title, status, priority, position, created_at, updated_at, automation_json)
+          VALUES ('66666666-6666-4666-8666-666666666667', 'default', 'escaped legacy', 'backlog', 'normal', 1, 1, 1, ?)
+        `,
+      ).run(escapedPayload);
+      db.close();
+      const legacyDigestBefore = rawDigest(fixture.dbPath, "66666666-6666-4666-8666-666666666667");
+      const result = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(result.reason_code).toBe("workboard_incompatible_legacy_card");
+      expect(result.card).toBeNull();
+      expect(receiptCount(fixture.dbPath, key)).toBe(1);
+      // Zero adoption, zero mutation: the legacy advertiser is untouched and no
+      // correlated card exists.
+      expect(rawDigest(fixture.dbPath, "66666666-6666-4666-8666-666666666667")).toBe(
+        legacyDigestBefore,
+      );
+      const check = new DatabaseSync(fixture.dbPath);
+      const adopted = check
+        .prepare("SELECT COUNT(*) AS n FROM workboard_cards WHERE correlation_key IS NOT NULL")
+        .get() as { n: number | bigint };
+      check.close();
+      expect(Number(adopted.n)).toBe(0);
+    } finally {
+      fixture.close();
     }
   });
 });

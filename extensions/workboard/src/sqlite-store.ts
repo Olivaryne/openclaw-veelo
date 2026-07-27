@@ -42,14 +42,6 @@ const ATOMIC_AUTHORITY_COLUMNS = [
 ] as const;
 const ATOMIC_CORRELATION_INDEX = "workboard_cards_correlation_key_uq";
 const ATOMIC_RECEIPTS_TABLE = "workboard_atomic_create_receipts";
-const ATOMIC_TRIGGERS = [
-  "workboard_cards_atomic_tuple_complete_insert",
-  "workboard_cards_atomic_tuple_complete_update",
-  "workboard_cards_atomic_tuple_immutable",
-  "workboard_cards_correlated_no_delete",
-  "workboard_atomic_create_receipts_no_update",
-  "workboard_atomic_create_receipts_no_delete",
-] as const;
 // Receipts are written only for the six store-durable outcomes (contract §4.3); the
 // CHECK constraints below enforce that plus the frozen outcome/reason pairing.
 const ATOMIC_RECEIPT_REASON_OUTCOME_PAIRS = [
@@ -410,171 +402,289 @@ function atomicTestFaultPoint(stage: string): void {
   }
 }
 
-function sqliteMasterNames(db: DatabaseSync, type: string): Set<string> {
-  return new Set(
-    (db.prepare("SELECT name FROM sqlite_master WHERE type = ?").all(type) as Row[]).flatMap(
-      (row) => (typeof row.name === "string" ? [row.name] : []),
-    ),
-  );
+// Frozen occurrence-key grammar (parent §2.2). Duplicated privately from store.ts to
+// keep this module free of a store.ts import cycle; both are asserted against the
+// frozen vectors in tests.
+const ATOMIC_OCCURRENCE_KEY_RE = /^occ_v1_[0-9a-f]{32}$/;
+
+function hexGlob(count: number): string {
+  return "[0-9a-f]".repeat(count);
 }
 
-type WorkboardAtomicSchemaState = {
-  ledgerComplete: boolean;
-  ledgerPresent: boolean;
-  objectsComplete: boolean;
-  objectsPresent: boolean;
-};
+const ATOMIC_UUID_GLOB = `${hexGlob(8)}-${hexGlob(4)}-[1-5]${hexGlob(3)}-[89ab]${hexGlob(3)}-${hexGlob(12)}`;
+const ATOMIC_KEY_GLOB = `occ_v1_${hexGlob(32)}`;
+const ATOMIC_FINGERPRINT_GLOB = `sha256:${hexGlob(64)}`;
 
-function workboardAtomicSchemaState(db: DatabaseSync): WorkboardAtomicSchemaState {
-  const ledgerRows = db
-    .prepare("SELECT id FROM workboard_schema_migrations WHERE id IN (?, ?)")
-    .all(...ATOMIC_SCHEMA_MIGRATION_IDS) as Row[];
-  const ledgerIds = new Set(ledgerRows.map((row) => row.id));
-  const columns = tableColumns(db, "workboard_cards");
-  const tables = sqliteMasterNames(db, "table");
-  const indexes = sqliteMasterNames(db, "index");
-  const triggers = sqliteMasterNames(db, "trigger");
-  const objectFlags = [
-    ...ATOMIC_AUTHORITY_COLUMNS.map((column) => columns.has(column)),
-    tables.has(ATOMIC_RECEIPTS_TABLE),
-    indexes.has(ATOMIC_CORRELATION_INDEX),
-    ...ATOMIC_TRIGGERS.map((trigger) => triggers.has(trigger)),
-  ];
-  return {
-    ledgerComplete: ATOMIC_SCHEMA_MIGRATION_IDS.every((id) => ledgerIds.has(id)),
-    ledgerPresent: ledgerIds.size > 0,
-    objectsComplete: objectFlags.every(Boolean),
-    objectsPresent: objectFlags.some(Boolean),
-  };
-}
-
-export function workboardAtomicSchemaComplete(db: DatabaseSync): boolean {
-  const state = workboardAtomicSchemaState(db);
-  return state.ledgerComplete && state.objectsComplete;
-}
-
-function atomicMigrationDdl(): string {
-  const reasonCodes = ATOMIC_RECEIPT_REASON_OUTCOME_PAIRS.map(([reason]) => `'${reason}'`).join(
+// Exact schema-3 object DDL. This is the single source of truth: the migration
+// executes exactly these statements and schema verification requires sqlite_master
+// to carry exactly these bytes (whitespace-normalized). A same-name object with any
+// other definition is tampered authority and fails closed.
+function atomicReceiptTableDdl(): string {
+  const durableReasons = ATOMIC_RECEIPT_REASON_OUTCOME_PAIRS.map(([reason]) => `'${reason}'`).join(
     ", ",
   );
   const reasonOutcomePairs = ATOMIC_RECEIPT_REASON_OUTCOME_PAIRS.map(
     ([reason, outcome]) => `(reason_code = '${reason}' AND outcome = '${outcome}')`,
-  ).join("\n        OR ");
-  return `
-    ALTER TABLE workboard_cards ADD COLUMN correlation_key TEXT;
-    ALTER TABLE workboard_cards ADD COLUMN governance_spec_version INTEGER;
-    ALTER TABLE workboard_cards ADD COLUMN governance_spec_json TEXT;
-    ALTER TABLE workboard_cards ADD COLUMN governance_fingerprint TEXT;
-
-    CREATE TRIGGER workboard_cards_atomic_tuple_complete_insert
-    BEFORE INSERT ON workboard_cards
-    WHEN NOT (
-      (
-        NEW.correlation_key IS NULL
-        AND NEW.governance_spec_version IS NULL
-        AND NEW.governance_spec_json IS NULL
-        AND NEW.governance_fingerprint IS NULL
-      )
-      OR
-      (
-        NEW.correlation_key IS NOT NULL
-        AND NEW.governance_spec_version IS NOT NULL
-        AND NEW.governance_spec_json IS NOT NULL
-        AND NEW.governance_fingerprint IS NOT NULL
-      )
+  ).join("\n    OR ");
+  return `CREATE TABLE workboard_atomic_create_receipts (
+  id TEXT PRIMARY KEY CHECK (id GLOB '${ATOMIC_UUID_GLOB}'),
+  correlation_key TEXT NOT NULL CHECK (correlation_key GLOB '${ATOMIC_KEY_GLOB}'),
+  card_id TEXT CHECK (card_id IS NULL OR card_id GLOB '${ATOMIC_UUID_GLOB}'),
+  request_fingerprint TEXT NOT NULL CHECK (request_fingerprint GLOB '${ATOMIC_FINGERPRINT_GLOB}'),
+  stored_fingerprint TEXT CHECK (
+    stored_fingerprint IS NULL OR stored_fingerprint GLOB '${ATOMIC_FINGERPRINT_GLOB}'
+  ),
+  outcome TEXT NOT NULL,
+  reason_code TEXT NOT NULL CHECK (reason_code IN (${durableReasons})),
+  detail_code TEXT CHECK (
+    detail_code IS NULL OR (
+      length(detail_code) BETWEEN 1 AND 64
+      AND substr(detail_code, 1, 1) GLOB '[a-z0-9]'
+      AND detail_code NOT GLOB '*[^a-z0-9._-]*'
     )
-    BEGIN
-      SELECT RAISE(ABORT, 'atomic governance tuple must be complete');
-    END;
+  ),
+  created_at INTEGER NOT NULL CHECK (created_at > 0),
+  CHECK (
+    ${reasonOutcomePairs}
+  ),
+  CHECK (
+    (reason_code IN ('workboard_card_created', 'workboard_card_recovered',
+      'workboard_card_conflict', 'workboard_card_state_incompatible')
+      AND card_id IS NOT NULL)
+    OR reason_code IN ('workboard_stored_record_invalid', 'workboard_incompatible_legacy_card')
+  ),
+  CHECK (
+    (reason_code IN ('workboard_card_created', 'workboard_card_recovered',
+      'workboard_card_conflict', 'workboard_card_state_incompatible')
+      AND stored_fingerprint IS NOT NULL)
+    OR reason_code = 'workboard_stored_record_invalid'
+    OR (reason_code = 'workboard_incompatible_legacy_card' AND stored_fingerprint IS NULL)
+  ),
+  CHECK (
+    (reason_code IN ('workboard_card_created', 'workboard_card_recovered',
+      'workboard_card_conflict') AND detail_code IS NULL)
+    OR (reason_code IN ('workboard_card_state_incompatible', 'workboard_stored_record_invalid')
+      AND detail_code IS NOT NULL)
+    OR reason_code = 'workboard_incompatible_legacy_card'
+  )
+)`;
+}
 
-    CREATE TRIGGER workboard_cards_atomic_tuple_complete_update
-    BEFORE UPDATE ON workboard_cards
-    WHEN NOT (
-      (
-        NEW.correlation_key IS NULL
-        AND NEW.governance_spec_version IS NULL
-        AND NEW.governance_spec_json IS NULL
-        AND NEW.governance_fingerprint IS NULL
-      )
-      OR
-      (
-        NEW.correlation_key IS NOT NULL
-        AND NEW.governance_spec_version IS NOT NULL
-        AND NEW.governance_spec_json IS NOT NULL
-        AND NEW.governance_fingerprint IS NOT NULL
-      )
-    )
-    BEGIN
-      SELECT RAISE(ABORT, 'atomic governance tuple must be complete');
-    END;
+type WorkboardAtomicSchemaObject = {
+  type: "table" | "index" | "trigger";
+  name: string;
+  ddl: string;
+};
 
-    CREATE TRIGGER workboard_cards_atomic_tuple_immutable
-    BEFORE UPDATE ON workboard_cards
-    WHEN OLD.correlation_key IS NOT NULL AND (
-      NEW.correlation_key IS NOT OLD.correlation_key
-      OR NEW.governance_spec_version IS NOT OLD.governance_spec_version
-      OR NEW.governance_spec_json IS NOT OLD.governance_spec_json
-      OR NEW.governance_fingerprint IS NOT OLD.governance_fingerprint
-    )
-    BEGIN
-      SELECT RAISE(ABORT, 'atomic governance tuple is immutable');
-    END;
+function atomicSchemaObjects(): WorkboardAtomicSchemaObject[] {
+  const tupleCompleteBody = `WHEN NOT (
+  (
+    NEW.correlation_key IS NULL
+    AND NEW.governance_spec_version IS NULL
+    AND NEW.governance_spec_json IS NULL
+    AND NEW.governance_fingerprint IS NULL
+  )
+  OR
+  (
+    NEW.correlation_key IS NOT NULL
+    AND NEW.governance_spec_version IS NOT NULL
+    AND NEW.governance_spec_json IS NOT NULL
+    AND NEW.governance_fingerprint IS NOT NULL
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'atomic governance tuple must be complete');
+END`;
+  return [
+    {
+      type: "trigger",
+      name: "workboard_cards_atomic_tuple_complete_insert",
+      ddl: `CREATE TRIGGER workboard_cards_atomic_tuple_complete_insert
+BEFORE INSERT ON workboard_cards
+${tupleCompleteBody}`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_cards_atomic_tuple_complete_update",
+      ddl: `CREATE TRIGGER workboard_cards_atomic_tuple_complete_update
+BEFORE UPDATE ON workboard_cards
+${tupleCompleteBody}`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_cards_atomic_tuple_immutable",
+      ddl: `CREATE TRIGGER workboard_cards_atomic_tuple_immutable
+BEFORE UPDATE ON workboard_cards
+WHEN OLD.correlation_key IS NOT NULL AND (
+  NEW.correlation_key IS NOT OLD.correlation_key
+  OR NEW.governance_spec_version IS NOT OLD.governance_spec_version
+  OR NEW.governance_spec_json IS NOT OLD.governance_spec_json
+  OR NEW.governance_fingerprint IS NOT OLD.governance_fingerprint
+)
+BEGIN
+  SELECT RAISE(ABORT, 'atomic governance tuple is immutable');
+END`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_cards_correlated_no_delete",
+      ddl: `CREATE TRIGGER workboard_cards_correlated_no_delete
+BEFORE DELETE ON workboard_cards
+WHEN OLD.correlation_key IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'correlated cards cannot be physically deleted');
+END`,
+    },
+    {
+      type: "table",
+      name: ATOMIC_RECEIPTS_TABLE,
+      ddl: atomicReceiptTableDdl(),
+    },
+    {
+      type: "trigger",
+      name: "workboard_atomic_create_receipts_no_update",
+      ddl: `CREATE TRIGGER workboard_atomic_create_receipts_no_update
+BEFORE UPDATE ON workboard_atomic_create_receipts
+BEGIN SELECT RAISE(ABORT, 'workboard atomic receipts are append-only'); END`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_atomic_create_receipts_no_delete",
+      ddl: `CREATE TRIGGER workboard_atomic_create_receipts_no_delete
+BEFORE DELETE ON workboard_atomic_create_receipts
+BEGIN SELECT RAISE(ABORT, 'workboard atomic receipts are append-only'); END`,
+    },
+    {
+      type: "index",
+      name: ATOMIC_CORRELATION_INDEX,
+      ddl: `CREATE UNIQUE INDEX workboard_cards_correlation_key_uq
+ON workboard_cards(correlation_key)
+WHERE correlation_key IS NOT NULL`,
+    },
+  ];
+}
 
-    CREATE TRIGGER workboard_cards_correlated_no_delete
-    BEFORE DELETE ON workboard_cards
-    WHEN OLD.correlation_key IS NOT NULL
-    BEGIN
-      SELECT RAISE(ABORT, 'correlated cards cannot be physically deleted');
-    END;
+function normalizeDdl(sql: string): string {
+  return sql.replace(/\s+/g, " ").replace(/;\s*$/, "").trim();
+}
 
-    CREATE TABLE workboard_atomic_create_receipts (
-      id TEXT PRIMARY KEY CHECK (length(id) = 36),
-      correlation_key TEXT NOT NULL
-        CHECK (length(correlation_key) = 39 AND substr(correlation_key, 1, 7) = 'occ_v1_'),
-      card_id TEXT CHECK (card_id IS NULL OR length(card_id) = 36),
-      request_fingerprint TEXT NOT NULL
-        CHECK (length(request_fingerprint) = 71 AND substr(request_fingerprint, 1, 7) = 'sha256:'),
-      stored_fingerprint TEXT CHECK (
-        stored_fingerprint IS NULL
-        OR (length(stored_fingerprint) = 71 AND substr(stored_fingerprint, 1, 7) = 'sha256:')
-      ),
-      outcome TEXT NOT NULL,
-      reason_code TEXT NOT NULL CHECK (reason_code IN (${reasonCodes})),
-      detail_code TEXT CHECK (detail_code IS NULL OR length(detail_code) BETWEEN 1 AND 64),
-      created_at INTEGER NOT NULL CHECK (created_at > 0),
-      CHECK (
-        ${reasonOutcomePairs}
-      )
+const ATOMIC_AUTHORITY_COLUMN_TYPES: Record<(typeof ATOMIC_AUTHORITY_COLUMNS)[number], string> = {
+  correlation_key: "TEXT",
+  governance_spec_version: "INTEGER",
+  governance_spec_json: "TEXT",
+  governance_fingerprint: "TEXT",
+};
+
+function allMigrationLedgerIds(db: DatabaseSync): string[] {
+  return (db.prepare("SELECT id FROM workboard_schema_migrations").all() as Row[]).flatMap((row) =>
+    typeof row.id === "string" ? [row.id] : [],
+  );
+}
+
+type WorkboardAtomicSchemaState = "complete" | "fresh-schema-2" | "refused";
+
+// Exact schema authority (parent §6.2 steps 5/10). Complete means: the migration
+// ledger is exactly {schema-2, schema-3, schema-3-aut-wb-atomic} (unknown or newer
+// rows refuse), the four authority columns exist with their exact declared types, and
+// every schema-3 object in sqlite_master carries exactly the frozen DDL bytes
+// (whitespace-normalized) - a same-name object with different DDL (e.g. a non-unique
+// or re-predicated index, or an altered trigger) is tampered authority.
+// fresh-schema-2 means: ledger exactly {schema-2} and zero schema-3 objects, the only
+// state the migration may transform. Everything else is refused, never repaired.
+function workboardAtomicSchemaState(db: DatabaseSync): WorkboardAtomicSchemaState {
+  const ledger = allMigrationLedgerIds(db).toSorted();
+  const completeLedger = [BASE_SCHEMA_MIGRATION_ID, ...ATOMIC_SCHEMA_MIGRATION_IDS].toSorted();
+  const ledgerIsComplete =
+    ledger.length === completeLedger.length &&
+    completeLedger.every((id, index) => ledger[index] === id);
+  const ledgerIsFresh = ledger.length === 1 && ledger[0] === BASE_SCHEMA_MIGRATION_ID;
+  const columnRows = db.prepare("PRAGMA table_info(workboard_cards)").all() as Row[];
+  const columnTypes = new Map(
+    columnRows.flatMap((row) =>
+      typeof row.name === "string" && typeof row.type === "string" ? [[row.name, row.type]] : [],
+    ),
+  );
+  const columnsExact = ATOMIC_AUTHORITY_COLUMNS.every(
+    (column) => columnTypes.get(column) === ATOMIC_AUTHORITY_COLUMN_TYPES[column],
+  );
+  const columnsPresent = ATOMIC_AUTHORITY_COLUMNS.some((column) => columnTypes.has(column));
+  const objectNames = new Set(atomicSchemaObjects().map((object) => object.name));
+  const masterSql = new Map(
+    (db.prepare("SELECT type, name, sql FROM sqlite_master").all() as Row[]).flatMap((row) =>
+      typeof row.name === "string" && objectNames.has(row.name)
+        ? [[row.name, { type: String(row.type), sql: typeof row.sql === "string" ? row.sql : "" }]]
+        : [],
+    ),
+  );
+  const objectsExact = atomicSchemaObjects().every((object) => {
+    const stored = masterSql.get(object.name);
+    return (
+      stored !== undefined &&
+      stored.type === object.type &&
+      normalizeDdl(stored.sql) === normalizeDdl(object.ddl)
     );
+  });
+  const objectsPresent = masterSql.size > 0;
+  if (ledgerIsComplete && columnsExact && objectsExact) {
+    return "complete";
+  }
+  if (ledgerIsFresh && !columnsPresent && !objectsPresent) {
+    return "fresh-schema-2";
+  }
+  return "refused";
+}
 
-    CREATE TRIGGER workboard_atomic_create_receipts_no_update
-    BEFORE UPDATE ON workboard_atomic_create_receipts
-    BEGIN SELECT RAISE(ABORT, 'workboard atomic receipts are append-only'); END;
+export function workboardAtomicSchemaComplete(db: DatabaseSync): boolean {
+  return workboardAtomicSchemaState(db) === "complete";
+}
 
-    CREATE TRIGGER workboard_atomic_create_receipts_no_delete
-    BEFORE DELETE ON workboard_atomic_create_receipts
-    BEGIN SELECT RAISE(ABORT, 'workboard atomic receipts are append-only'); END;
-  `;
+// Migration-time legacy scan (§6.2 step 7): parse every legacy automation payload,
+// validate every AUT-shaped occurrence-key claim against the frozen grammar, and
+// refuse duplicate or malformed AUT occurrence keys. Nothing is adopted or
+// backfilled (operator decision 3); any violation throws and rolls the migration
+// back. Raw substring matching is never used as semantic authority.
+function assertLegacyAutomationAuthorityScannable(db: DatabaseSync): void {
+  const legacyRows = db
+    .prepare("SELECT id, automation_json FROM workboard_cards WHERE automation_json IS NOT NULL")
+    .all() as Row[];
+  const seenKeys = new Map<string, string>();
+  for (const row of legacyRows) {
+    const parsed: unknown = JSON.parse(String(row.automation_json));
+    const idempotencyKey =
+      parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>).idempotencyKey
+        : undefined;
+    if (idempotencyKey === undefined) {
+      continue;
+    }
+    const claimsAutKey = typeof idempotencyKey === "string" && idempotencyKey.startsWith("occ_v1_");
+    if (!claimsAutKey) {
+      continue;
+    }
+    if (!ATOMIC_OCCURRENCE_KEY_RE.test(idempotencyKey)) {
+      throw new Error(`legacy card ${String(row.id)} advertises a malformed AUT occurrence key`);
+    }
+    const previous = seenKeys.get(idempotencyKey);
+    if (previous !== undefined) {
+      throw new Error(
+        `legacy cards ${previous} and ${String(row.id)} advertise the same AUT occurrence key`,
+      );
+    }
+    seenKeys.set(idempotencyKey, String(row.id));
+  }
 }
 
 // Contract §6.2: one transaction covering DDL, legacy scan, unique index, and ledger.
 // Returns true when schema 3 is complete afterwards. Never throws for migration
 // failure: legacy schema-2 surfaces must keep working (§6.3) and the atomic method
-// then refuses with workboard_atomic_migration_required.
+// then refuses with workboard_atomic_migration_required. Only the exact
+// fresh-schema-2 state is ever migrated; refused states are never repaired.
 function ensureWorkboardAtomicSchema(db: DatabaseSync): boolean {
   const state = workboardAtomicSchemaState(db);
-  if (state.ledgerComplete && state.objectsComplete) {
+  if (state === "complete") {
     return true;
   }
-  if (state.ledgerPresent || state.objectsPresent) {
-    // Partial/tampered state cannot arise from this transactional migration; do not
-    // guess a repair. Atomic calls refuse until an operator restores a clean state.
-    return false;
-  }
-  const baseRow = db
-    .prepare("SELECT id FROM workboard_schema_migrations WHERE id = ?")
-    .get(BASE_SCHEMA_MIGRATION_ID);
-  if (!baseRow) {
+  if (state === "refused") {
     return false;
   }
   try {
@@ -583,22 +693,24 @@ function ensureWorkboardAtomicSchema(db: DatabaseSync): boolean {
     return false;
   }
   try {
-    db.exec(atomicMigrationDdl());
-    atomicTestCrashPoint("migration-ddl");
-    // Legacy scan (§6.2 step 7): every legacy automation payload must be readable so
-    // call-time legacy detection stays deterministic. Nothing is adopted or backfilled
-    // (operator decision 3); unreadable metadata aborts the migration.
-    const legacyRows = db
-      .prepare("SELECT id, automation_json FROM workboard_cards WHERE automation_json IS NOT NULL")
-      .all() as Row[];
-    for (const row of legacyRows) {
-      JSON.parse(String(row.automation_json));
-    }
     db.exec(`
-      CREATE UNIQUE INDEX ${ATOMIC_CORRELATION_INDEX}
-      ON workboard_cards(correlation_key)
-      WHERE correlation_key IS NOT NULL;
+      ALTER TABLE workboard_cards ADD COLUMN correlation_key TEXT;
+      ALTER TABLE workboard_cards ADD COLUMN governance_spec_version INTEGER;
+      ALTER TABLE workboard_cards ADD COLUMN governance_spec_json TEXT;
+      ALTER TABLE workboard_cards ADD COLUMN governance_fingerprint TEXT;
     `);
+    for (const object of atomicSchemaObjects()) {
+      if (object.type !== "index") {
+        db.exec(object.ddl);
+      }
+    }
+    atomicTestCrashPoint("migration-ddl");
+    assertLegacyAutomationAuthorityScannable(db);
+    for (const object of atomicSchemaObjects()) {
+      if (object.type === "index") {
+        db.exec(object.ddl);
+      }
+    }
     atomicTestCrashPoint("migration-index");
     const insertLedger = db.prepare(
       "INSERT INTO workboard_schema_migrations (id, applied_at) VALUES (?, ?)",
@@ -1345,6 +1457,15 @@ export type WorkboardAtomicStoredCardRow = {
   agentId: string | null;
   claimJson: string | null;
   executionId: string | null;
+  executionKind: string | null;
+  executionEngine: string | null;
+  executionMode: string | null;
+  executionStatus: string | null;
+  executionModel: string | null;
+  executionSessionKey: string | null;
+  executionRunId: string | null;
+  executionStartedAt: number | null;
+  executionUpdatedAt: number | null;
   startedAt: number | null;
   completedAt: number | null;
   archivedAt: number | null;
@@ -1536,6 +1657,15 @@ class WorkboardSqliteCardStore implements WorkboardKeyedStore, WorkboardAtomicCa
       agentId: nullableString(row, "agent_id"),
       claimJson: nullableString(row, "claim_json"),
       executionId: nullableString(row, "execution_id"),
+      executionKind: nullableString(row, "execution_kind"),
+      executionEngine: nullableString(row, "execution_engine"),
+      executionMode: nullableString(row, "execution_mode"),
+      executionStatus: nullableString(row, "execution_status"),
+      executionModel: nullableString(row, "execution_model"),
+      executionSessionKey: nullableString(row, "execution_session_key"),
+      executionRunId: nullableString(row, "execution_run_id"),
+      executionStartedAt: nullableNumber(row, "execution_started_at"),
+      executionUpdatedAt: nullableNumber(row, "execution_updated_at"),
       startedAt: nullableNumber(row, "started_at"),
       completedAt: nullableNumber(row, "completed_at"),
       archivedAt: nullableNumber(row, "archived_at"),
@@ -1548,8 +1678,11 @@ class WorkboardSqliteCardStore implements WorkboardKeyedStore, WorkboardAtomicCa
   }
 
   // Rows other than `excludeCardId` whose legacy automation payload advertises the key.
+  // Every legacy payload is parsed and compared semantically - raw JSON substring
+  // matching is never the authority, so JSON-escaped but equal keys are detected.
   // Returns candidate ids in deterministic order plus the first row whose payload is
-  // unreadable (contract §6.3: malformed legacy metadata fails closed).
+  // unreadable (contract §6.3: malformed legacy metadata fails closed - an unreadable
+  // payload cannot be proven not to advertise the key).
   private scanLegacyAdvertisers(
     correlationKey: string,
     excludeCardId: string | null,
@@ -1560,11 +1693,10 @@ class WorkboardSqliteCardStore implements WorkboardKeyedStore, WorkboardAtomicCa
           SELECT id, automation_json FROM workboard_cards
           WHERE correlation_key IS NULL
             AND automation_json IS NOT NULL
-            AND instr(automation_json, ?) > 0
           ORDER BY created_at ASC, id ASC
         `,
       )
-      .all(correlationKey) as Row[];
+      .all() as Row[];
     const candidateIds: string[] = [];
     let malformedId: string | null = null;
     for (const row of rows) {

@@ -429,6 +429,7 @@ describe("workboard gateway methods", () => {
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { createWorkboardSqliteStores } from "./sqlite-store.js";
 import { atomicCardNotes, atomicCardTitle, deriveAtomicOccurrenceKey } from "./store.js";
 import type { AtomicCreateResponseV1, CanonicalAutomationCardSpecV1 } from "./types.js";
@@ -701,12 +702,40 @@ describe("workboard atomic gateway methods", () => {
       const envelope = retry.payload as AtomicCreateResponseV1;
       expect(envelope.reason_code).toBe("workboard_card_recovered");
       expect(envelope.card).not.toBeNull();
-      // The create receipt from the lost-response call resolves after the retry.
-      const receiptId = envelope.evidence?.ref.split("/").pop() as string;
-      const lookup = await invoke(methods, "workboard.atomicCreateReceipts.get", { id: receiptId });
-      expect((lookup.payload as { receipt: { reason_code: string } }).receipt.reason_code).toBe(
-        "workboard_card_recovered",
-      );
+      // Two DISTINCT receipts exist and both resolve (Round-1 proof gap 4):
+      // 1. the ORIGINAL create receipt, committed by the lost-response call, which
+      //    survived independently of the dropped transport response;
+      // 2. the LATER recovery receipt referenced by the retry envelope.
+      // The retry's evidence is never the lost create receipt. The full A04 row
+      // (real transport loss + caller receipts) is BIND-owned; this is the server
+      // sub-proof only.
+      const db = new DatabaseSync(path.join(dir, "workboard.sqlite"));
+      const persisted = db
+        .prepare(
+          "SELECT id, reason_code, card_id FROM workboard_atomic_create_receipts WHERE correlation_key = ?",
+        )
+        .all(key) as Array<{ id: string; reason_code: string; card_id: string }>;
+      db.close();
+      expect(persisted).toHaveLength(2);
+      const createReceipt = persisted.find((row) => row.reason_code === "workboard_card_created");
+      const recoveryReceiptId = envelope.evidence?.ref.split("/").pop() as string;
+      const recoveryReceipt = persisted.find((row) => row.id === recoveryReceiptId);
+      expect(createReceipt).toBeTruthy();
+      expect(recoveryReceipt?.reason_code).toBe("workboard_card_recovered");
+      expect(createReceipt?.id).not.toBe(recoveryReceiptId);
+      expect(createReceipt?.card_id).toBe(envelope.card?.id);
+      const createLookup = await invoke(methods, "workboard.atomicCreateReceipts.get", {
+        id: createReceipt?.id as string,
+      });
+      expect(
+        (createLookup.payload as { receipt: { reason_code: string } }).receipt.reason_code,
+      ).toBe("workboard_card_created");
+      const recoveryLookup = await invoke(methods, "workboard.atomicCreateReceipts.get", {
+        id: recoveryReceiptId,
+      });
+      expect(
+        (recoveryLookup.payload as { receipt: { reason_code: string } }).receipt.reason_code,
+      ).toBe("workboard_card_recovered");
       stores.close();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

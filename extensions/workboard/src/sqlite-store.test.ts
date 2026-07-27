@@ -211,26 +211,99 @@ function receiptRows(dbPath: string, key: string): Array<Record<string, unknown>
   }
 }
 
-// Digest of one card row plus every child row: the no-mutation oracle for refusals.
+// Digest of one card row plus EVERY child-data surface (all twelve child tables and
+// attachment blob bytes): the no-mutation oracle for refusals and recoveries.
+const FULL_CARD_CHILD_TABLES = [
+  "workboard_card_labels",
+  "workboard_card_events",
+  "workboard_card_attempts",
+  "workboard_card_comments",
+  "workboard_card_links",
+  "workboard_card_proof",
+  "workboard_card_artifacts",
+  "workboard_card_attachments",
+  "workboard_card_diagnostics",
+  "workboard_card_notifications",
+  "workboard_worker_logs",
+  "workboard_worker_protocol",
+] as const;
+
 function cardDigest(dbPath: string, cardId: string): string {
   const db = new DatabaseSync(dbPath);
   try {
     const card = db.prepare("SELECT * FROM workboard_cards WHERE id = ?").get(cardId);
-    const children = [
-      "workboard_card_labels",
-      "workboard_card_events",
-      "workboard_card_attempts",
-      "workboard_card_comments",
-      "workboard_card_links",
-      "workboard_card_proof",
-      "workboard_card_artifacts",
-      "workboard_card_attachments",
-    ].map((table) =>
+    const children = FULL_CARD_CHILD_TABLES.map((table) =>
       db.prepare(`SELECT * FROM ${table} WHERE card_id = ? ORDER BY rowid`).all(cardId),
     );
-    return JSON.stringify({ card, children }, (_key, value) =>
+    const attachmentBlobs = db
+      .prepare(
+        `
+          SELECT a.id AS attachment_id, hex(b.content) AS content_hex
+          FROM workboard_card_attachments a
+          JOIN workboard_attachment_blobs b ON b.attachment_id = a.id
+          WHERE a.card_id = ? ORDER BY a.id
+        `,
+      )
+      .all(cardId);
+    return JSON.stringify({ card, children, attachmentBlobs }, (_key, value) =>
       typeof value === "bigint" ? Number(value) : value,
     );
+  } finally {
+    db.close();
+  }
+}
+
+// Build schema 3 with current code, then strip the atomic objects back to the exact
+// schema-2 object set so the migration can run against a real legacy DB. Each entry
+// in legacyAutomationJson becomes one legacy card row (raw payload bytes).
+function makeSchema2Fixture(dbPath: string, legacyAutomationJson: string[] = []): void {
+  openStore(dbPath).stores.close();
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      DROP TRIGGER workboard_cards_atomic_tuple_complete_insert;
+      DROP TRIGGER workboard_cards_atomic_tuple_complete_update;
+      DROP TRIGGER workboard_cards_atomic_tuple_immutable;
+      DROP TRIGGER workboard_cards_correlated_no_delete;
+      DROP TRIGGER workboard_atomic_create_receipts_no_update;
+      DROP TRIGGER workboard_atomic_create_receipts_no_delete;
+      DROP TABLE workboard_atomic_create_receipts;
+      DROP INDEX workboard_cards_correlation_key_uq;
+      ALTER TABLE workboard_cards DROP COLUMN correlation_key;
+      ALTER TABLE workboard_cards DROP COLUMN governance_spec_version;
+      ALTER TABLE workboard_cards DROP COLUMN governance_spec_json;
+      ALTER TABLE workboard_cards DROP COLUMN governance_fingerprint;
+      DELETE FROM workboard_schema_migrations WHERE id IN ('schema-3', 'schema-3-aut-wb-atomic');
+    `);
+    legacyAutomationJson.forEach((payload, index) => {
+      db.prepare(
+        `
+          INSERT INTO workboard_cards
+            (id, board_id, title, status, priority, position, created_at, updated_at, automation_json)
+          VALUES (?, 'default', ?, 'backlog', 'normal', ?, ?, ?, ?)
+        `,
+      ).run(
+        `11111111-1111-4111-8111-1111111111${String(index + 10)}`,
+        `legacy card ${index}`,
+        1000 + index,
+        index + 1,
+        index + 1,
+        payload,
+      );
+    });
+  } finally {
+    db.close();
+  }
+}
+
+function migrationLedger(dbPath: string): string[] {
+  const db = new DatabaseSync(dbPath);
+  try {
+    return (
+      db.prepare("SELECT id FROM workboard_schema_migrations ORDER BY id").all() as Array<{
+        id: string;
+      }>
+    ).map((row) => row.id);
   } finally {
     db.close();
   }
@@ -303,41 +376,6 @@ describe("workboard atomic schema-3 migration", () => {
     stores.close();
   });
 
-  function makeSchema2Fixture(dbPath: string, legacyAutomationJson?: string): void {
-    // Build schema 3 with current code, then strip the atomic objects back to the
-    // exact schema-2 object set so the migration can run against a real legacy DB.
-    openStore(dbPath).stores.close();
-    const db = new DatabaseSync(dbPath);
-    try {
-      db.exec(`
-        DROP TRIGGER workboard_cards_atomic_tuple_complete_insert;
-        DROP TRIGGER workboard_cards_atomic_tuple_complete_update;
-        DROP TRIGGER workboard_cards_atomic_tuple_immutable;
-        DROP TRIGGER workboard_cards_correlated_no_delete;
-        DROP TRIGGER workboard_atomic_create_receipts_no_update;
-        DROP TRIGGER workboard_atomic_create_receipts_no_delete;
-        DROP TABLE workboard_atomic_create_receipts;
-        DROP INDEX workboard_cards_correlation_key_uq;
-        ALTER TABLE workboard_cards DROP COLUMN correlation_key;
-        ALTER TABLE workboard_cards DROP COLUMN governance_spec_version;
-        ALTER TABLE workboard_cards DROP COLUMN governance_spec_json;
-        ALTER TABLE workboard_cards DROP COLUMN governance_fingerprint;
-        DELETE FROM workboard_schema_migrations WHERE id IN ('schema-3', 'schema-3-aut-wb-atomic');
-      `);
-      if (legacyAutomationJson !== undefined) {
-        db.prepare(
-          `
-            INSERT INTO workboard_cards
-              (id, board_id, title, status, priority, position, created_at, updated_at, automation_json)
-            VALUES (?, 'default', 'legacy card', 'backlog', 'normal', 1000, 1, 1, ?)
-          `,
-        ).run("11111111-1111-4111-8111-111111111111", legacyAutomationJson);
-      }
-    } finally {
-      db.close();
-    }
-  }
-
   it("A34: kills at DDL, index, and ledger stages roll back completely; restart completes", async () => {
     for (const stage of ["migration-ddl", "migration-index", "migration-ledger"]) {
       const dbPath = path.join(workDir, `wb-${stage}.sqlite`);
@@ -408,7 +446,7 @@ describe("workboard atomic schema-3 migration", () => {
 
   it("legacy scan aborts the migration when legacy automation metadata is unreadable", () => {
     const dbPath = path.join(workDir, "workboard.sqlite");
-    makeSchema2Fixture(dbPath, "{not json");
+    makeSchema2Fixture(dbPath, ["{not json"]);
     const { stores, store } = openStore(dbPath);
     try {
       expect(store.supportsAtomicCreate()).toBe(false);
@@ -509,11 +547,11 @@ describe("workboard atomic real-process concurrency", () => {
     }
   }, 600_000);
 
-  it("A03: different keys create independent cards concurrently", async () => {
+  it("A03: 16 OS-process calls across two keys create exactly one independent card per key", async () => {
     const dbPath = path.join(workDir, "workboard.sqlite");
     openStore(dbPath).stores.close();
     const go = path.join(workDir, "go");
-    const children = Array.from({ length: 8 }, (_value, index) =>
+    const children = Array.from({ length: 16 }, (_value, index) =>
       spawnDriver({
         dbPath,
         automationId: index % 2 === 0 ? "aut-key.alpha" : "aut-key.beta",
@@ -525,7 +563,7 @@ describe("workboard atomic real-process concurrency", () => {
     const exits = Promise.all(children.map((child) => waitForExit(child)));
     const deadline = Date.now() + 60_000;
     while (
-      Array.from({ length: 8 }, (_value, index) => path.join(workDir, `ready-${index}`)).some(
+      Array.from({ length: 16 }, (_value, index) => path.join(workDir, `ready-${index}`)).some(
         (file) => !fs.existsSync(file),
       )
     ) {
@@ -536,7 +574,7 @@ describe("workboard atomic real-process concurrency", () => {
     for (const exit of await exits) {
       expect(exit.code).toBe(0);
     }
-    const results = Array.from({ length: 8 }, (_value, index) =>
+    const results = Array.from({ length: 16 }, (_value, index) =>
       readEnvelope(path.join(workDir, `out-${index}.json`)),
     );
     const byKey = new Map<string, AtomicCreateResponseV1[]>();
@@ -546,12 +584,15 @@ describe("workboard atomic real-process concurrency", () => {
     }
     expect(byKey.size).toBe(2);
     for (const [key, group] of byKey) {
+      expect(group).toHaveLength(8);
       expect(group.filter((r) => r.reason_code === "workboard_card_created")).toHaveLength(1);
-      expect(group.filter((r) => r.reason_code === "workboard_card_recovered")).toHaveLength(3);
+      expect(group.filter((r) => r.reason_code === "workboard_card_recovered")).toHaveLength(7);
       expect(new Set(group.map((r) => r.card?.id)).size).toBe(1);
       expect(cardCount(dbPath, key)).toBe(1);
+      expect(receiptRows(dbPath, key)).toHaveLength(8);
     }
-  }, 180_000);
+    expect(new Set(results.map((r) => r.card?.id)).size).toBe(2);
+  }, 240_000);
 
   it("A05: a kill before COMMIT rolls back; retry creates cleanly", async () => {
     const dbPath = path.join(workDir, "workboard.sqlite");
@@ -1063,4 +1104,462 @@ describe("workboard atomic rollback compatibility (A35)", () => {
       oldStores.close();
     }
   }, 120_000);
+});
+
+describe("workboard atomic exact schema authority (Round-1 defect 1)", () => {
+  function reopenSupports(dbPath: string): boolean {
+    const { stores, store } = openStore(dbPath);
+    const supports = store.supportsAtomicCreate();
+    stores.close();
+    return supports;
+  }
+
+  it("an unknown schema-999 ledger row blocks migration and the atomic surface", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    makeSchema2Fixture(dbPath);
+    const db = new DatabaseSync(dbPath);
+    db.prepare(
+      "INSERT INTO workboard_schema_migrations (id, applied_at) VALUES ('schema-999', 1)",
+    ).run();
+    db.close();
+    expect(reopenSupports(dbPath)).toBe(false);
+    // The migration must not have run at all: no authority columns, ledger unchanged.
+    const check = new DatabaseSync(dbPath);
+    const columns = new Set(
+      (check.prepare("PRAGMA table_info(workboard_cards)").all() as Array<{ name: string }>).map(
+        (row) => row.name,
+      ),
+    );
+    check.close();
+    expect(columns.has("correlation_key")).toBe(false);
+    expect(migrationLedger(dbPath)).toEqual(["schema-2", "schema-999"]);
+  });
+
+  it("an extra ledger row on a complete schema refuses the atomic surface", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    openStore(dbPath).stores.close();
+    const db = new DatabaseSync(dbPath);
+    db.prepare(
+      "INSERT INTO workboard_schema_migrations (id, applied_at) VALUES ('schema-999', 1)",
+    ).run();
+    db.close();
+    expect(reopenSupports(dbPath)).toBe(false);
+  });
+
+  it("a missing required ledger row refuses the atomic surface", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    openStore(dbPath).stores.close();
+    const db = new DatabaseSync(dbPath);
+    db.exec("DELETE FROM workboard_schema_migrations WHERE id = 'schema-3'");
+    db.close();
+    expect(reopenSupports(dbPath)).toBe(false);
+  });
+
+  it("a same-name non-unique correlation index is tampered authority and refuses", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    openStore(dbPath).stores.close();
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      DROP INDEX workboard_cards_correlation_key_uq;
+      CREATE INDEX workboard_cards_correlation_key_uq
+      ON workboard_cards(correlation_key)
+      WHERE correlation_key IS NOT NULL;
+    `);
+    db.close();
+    expect(reopenSupports(dbPath)).toBe(false);
+  });
+
+  it("a changed partial-index predicate is tampered authority and refuses", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    openStore(dbPath).stores.close();
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      DROP INDEX workboard_cards_correlation_key_uq;
+      CREATE UNIQUE INDEX workboard_cards_correlation_key_uq
+      ON workboard_cards(correlation_key)
+      WHERE correlation_key IS NOT NULL AND correlation_key != '';
+    `);
+    db.close();
+    expect(reopenSupports(dbPath)).toBe(false);
+  });
+
+  it("an altered trigger definition is tampered authority and refuses", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    openStore(dbPath).stores.close();
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      DROP TRIGGER workboard_cards_correlated_no_delete;
+      CREATE TRIGGER workboard_cards_correlated_no_delete
+      BEFORE DELETE ON workboard_cards
+      WHEN OLD.correlation_key IS NOT NULL AND 0
+      BEGIN
+        SELECT RAISE(ABORT, 'correlated cards cannot be physically deleted');
+      END;
+    `);
+    db.close();
+    expect(reopenSupports(dbPath)).toBe(false);
+  });
+
+  it("partial schema objects refuse and are never silently repaired", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    openStore(dbPath).stores.close();
+    const db = new DatabaseSync(dbPath);
+    // Dropping the table also drops its append-only triggers.
+    db.exec("DROP TABLE workboard_atomic_create_receipts");
+    db.close();
+    expect(reopenSupports(dbPath)).toBe(false);
+    const check = new DatabaseSync(dbPath);
+    const tables = (
+      check
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='workboard_atomic_create_receipts'",
+        )
+        .all() as Array<{ name: string }>
+    ).map((row) => row.name);
+    check.close();
+    expect(tables).toHaveLength(0);
+  });
+
+  it("the exact valid schema reopens successfully (control)", async () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    openStore(dbPath).stores.close();
+    expect(reopenSupports(dbPath)).toBe(true);
+    const { stores, store } = openStore(dbPath);
+    try {
+      const { key, spec } = makeAtomicSpec("aut-schema.control", "2026-08-03T12:00:00.000Z");
+      const created = await store.createOrRecoverByCorrelationKey(key, spec);
+      expect(created.reason_code).toBe("workboard_card_created");
+    } finally {
+      stores.close();
+    }
+  });
+});
+
+describe("workboard atomic legacy authority (Round-1 defect 2)", () => {
+  const KEY_A = `occ_v1_${"a".repeat(32)}`;
+  const KEY_B = `occ_v1_${"b".repeat(32)}`;
+
+  it("migration refuses two valid legacy advertisers with the same occurrence key", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    makeSchema2Fixture(dbPath, [
+      JSON.stringify({ idempotencyKey: KEY_A }),
+      JSON.stringify({ idempotencyKey: KEY_A, boardId: "other" }),
+    ]);
+    const { stores, store } = openStore(dbPath);
+    expect(store.supportsAtomicCreate()).toBe(false);
+    stores.close();
+    expect(migrationLedger(dbPath)).toEqual(["schema-2"]);
+  });
+
+  it("migration refuses a malformed occ_v1_ occurrence-key value", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    makeSchema2Fixture(dbPath, [JSON.stringify({ idempotencyKey: "occ_v1_BAD" })]);
+    const { stores, store } = openStore(dbPath);
+    expect(store.supportsAtomicCreate()).toBe(false);
+    stores.close();
+    expect(migrationLedger(dbPath)).toEqual(["schema-2"]);
+  });
+
+  it("migration succeeds with multiple unrelated legacy cards and adopts nothing", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    makeSchema2Fixture(dbPath, [
+      JSON.stringify({ idempotencyKey: KEY_A }),
+      JSON.stringify({ idempotencyKey: KEY_B }),
+      JSON.stringify({ idempotencyKey: "ordinary-generic-key" }),
+      JSON.stringify({ boardId: "no-key-at-all" }),
+    ]);
+    const { stores, store } = openStore(dbPath);
+    expect(store.supportsAtomicCreate()).toBe(true);
+    stores.close();
+    const db = new DatabaseSync(dbPath);
+    const adopted = db
+      .prepare("SELECT COUNT(*) AS n FROM workboard_cards WHERE correlation_key IS NOT NULL")
+      .get() as { n: number | bigint };
+    db.close();
+    expect(Number(adopted.n)).toBe(0);
+    expect(migrationLedger(dbPath)).toEqual(["schema-2", "schema-3", "schema-3-aut-wb-atomic"]);
+  });
+
+  it("migration refuses a malformed unrelated payload (frozen migration policy)", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    makeSchema2Fixture(dbPath, [
+      JSON.stringify({ idempotencyKey: KEY_A }),
+      "{completely broken and unrelated to any key",
+    ]);
+    const { stores, store } = openStore(dbPath);
+    expect(store.supportsAtomicCreate()).toBe(false);
+    stores.close();
+    expect(migrationLedger(dbPath)).toEqual(["schema-2"]);
+  });
+
+  it("a JSON-escaped but semantically equal legacy key is detected; no card is created beside it", async () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    openStore(dbPath).stores.close();
+    const { key, spec } = makeAtomicSpec("aut-legacy.escaped", "2026-08-03T12:00:00.000Z");
+    // Escape one character of the key as a \u sequence: JSON.parse yields the exact
+    // key while the raw payload text never contains the key substring.
+    const escapedChar = `\\u00${key.charCodeAt(10).toString(16).padStart(2, "0")}`;
+    const escapedPayload = `{"idempotencyKey":"${key.slice(0, 10)}${escapedChar}${key.slice(11)}"}`;
+    expect(escapedPayload.includes(key)).toBe(false);
+    expect((JSON.parse(escapedPayload) as { idempotencyKey: string }).idempotencyKey).toBe(key);
+    const db = new DatabaseSync(dbPath);
+    db.prepare(
+      `
+        INSERT INTO workboard_cards
+          (id, board_id, title, status, priority, position, created_at, updated_at, automation_json)
+        VALUES ('66666666-6666-4666-8666-666666666666', 'default', 'escaped legacy', 'backlog', 'normal', 1, 1, 1, ?)
+      `,
+    ).run(escapedPayload);
+    db.close();
+    const { stores, store } = openStore(dbPath);
+    try {
+      const result = await store.createOrRecoverByCorrelationKey(key, spec);
+      expect(result.reason_code).toBe("workboard_incompatible_legacy_card");
+      expect(result.card).toBeNull();
+      expect(cardCount(dbPath, key)).toBe(0);
+      const receipts = receiptRows(dbPath, key);
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]?.card_id).toBe("66666666-6666-4666-8666-666666666666");
+    } finally {
+      stores.close();
+    }
+  });
+});
+
+describe("workboard atomic receipt authority (Round-1 defect 5)", () => {
+  const VALID_FP = `sha256:${"a".repeat(64)}`;
+  const VALID_KEY = `occ_v1_${"c".repeat(32)}`;
+  const VALID_UUID = "77777777-7777-4777-8777-777777777777";
+  const OTHER_UUID = "88888888-8888-4888-8888-888888888888";
+
+  function receiptInsert(dbPath: string) {
+    const db = new DatabaseSync(dbPath);
+    const statement = db.prepare(
+      `
+        INSERT INTO workboard_atomic_create_receipts
+          (id, correlation_key, card_id, request_fingerprint, stored_fingerprint,
+           outcome, reason_code, detail_code, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+    );
+    return { db, statement };
+  }
+
+  it("the receipt table refuses malformed or mispaired rows at the SQLite boundary", () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    openStore(dbPath).stores.close();
+    const { db, statement } = receiptInsert(dbPath);
+    try {
+      const attempts: Array<[string, unknown[]]> = [
+        [
+          "uppercase correlation key",
+          [
+            VALID_UUID,
+            VALID_KEY.toUpperCase(),
+            OTHER_UUID,
+            VALID_FP,
+            VALID_FP,
+            "created",
+            "workboard_card_created",
+            null,
+            1,
+          ],
+        ],
+        [
+          "malformed fingerprint",
+          [
+            VALID_UUID,
+            VALID_KEY,
+            OTHER_UUID,
+            "sha256:NOT-HEX",
+            VALID_FP,
+            "created",
+            "workboard_card_created",
+            null,
+            1,
+          ],
+        ],
+        [
+          "null card_id on created",
+          [
+            VALID_UUID,
+            VALID_KEY,
+            null,
+            VALID_FP,
+            VALID_FP,
+            "created",
+            "workboard_card_created",
+            null,
+            1,
+          ],
+        ],
+        [
+          "null card_id on recovered",
+          [
+            VALID_UUID,
+            VALID_KEY,
+            null,
+            VALID_FP,
+            VALID_FP,
+            "recovered",
+            "workboard_card_recovered",
+            null,
+            1,
+          ],
+        ],
+        [
+          "stored_fingerprint forbidden on legacy refusal",
+          [
+            VALID_UUID,
+            VALID_KEY,
+            null,
+            VALID_FP,
+            VALID_FP,
+            "refused",
+            "workboard_incompatible_legacy_card",
+            null,
+            1,
+          ],
+        ],
+        [
+          "free-form detail code",
+          [
+            VALID_UUID,
+            VALID_KEY,
+            OTHER_UUID,
+            VALID_FP,
+            VALID_FP,
+            "refused",
+            "workboard_card_state_incompatible",
+            "This Is Prose!",
+            1,
+          ],
+        ],
+        [
+          "missing detail code on state refusal",
+          [
+            VALID_UUID,
+            VALID_KEY,
+            OTHER_UUID,
+            VALID_FP,
+            VALID_FP,
+            "refused",
+            "workboard_card_state_incompatible",
+            null,
+            1,
+          ],
+        ],
+        [
+          "detail code forbidden on created",
+          [
+            VALID_UUID,
+            VALID_KEY,
+            OTHER_UUID,
+            VALID_FP,
+            VALID_FP,
+            "created",
+            "workboard_card_created",
+            "card-assigned",
+            1,
+          ],
+        ],
+        [
+          "wrong outcome/reason pairing",
+          [
+            VALID_UUID,
+            VALID_KEY,
+            OTHER_UUID,
+            VALID_FP,
+            VALID_FP,
+            "created",
+            "workboard_card_recovered",
+            null,
+            1,
+          ],
+        ],
+        [
+          "non-durable reason code",
+          [VALID_UUID, VALID_KEY, null, VALID_FP, null, "failed", "workboard_unavailable", null, 1],
+        ],
+        [
+          "malformed uuid",
+          [
+            "not-a-uuid",
+            VALID_KEY,
+            OTHER_UUID,
+            VALID_FP,
+            VALID_FP,
+            "created",
+            "workboard_card_created",
+            null,
+            1,
+          ],
+        ],
+        [
+          "missing stored fingerprint on conflict",
+          [
+            VALID_UUID,
+            VALID_KEY,
+            OTHER_UUID,
+            VALID_FP,
+            null,
+            "refused",
+            "workboard_card_conflict",
+            null,
+            1,
+          ],
+        ],
+      ];
+      for (const [label, values] of attempts) {
+        expect(() => statement.run(...(values as never[])), label).toThrow(/CHECK/);
+      }
+      // Valid receipt control row is accepted.
+      statement.run(
+        VALID_UUID,
+        VALID_KEY,
+        OTHER_UUID,
+        VALID_FP,
+        VALID_FP,
+        "created",
+        "workboard_card_created",
+        null,
+        1,
+      );
+      const count = db
+        .prepare("SELECT COUNT(*) AS n FROM workboard_atomic_create_receipts")
+        .get() as { n: number | bigint };
+      expect(Number(count.n)).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("the valid control receipt resolves through the closed read-only lookup", async () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    const { stores, store } = openStore(dbPath);
+    try {
+      const db = new DatabaseSync(dbPath);
+      db.prepare(
+        `
+          INSERT INTO workboard_atomic_create_receipts
+            (id, correlation_key, card_id, request_fingerprint, stored_fingerprint,
+             outcome, reason_code, detail_code, created_at)
+          VALUES (?, ?, ?, ?, ?, 'created', 'workboard_card_created', NULL, 5)
+        `,
+      ).run(VALID_UUID, VALID_KEY, OTHER_UUID, VALID_FP, VALID_FP);
+      db.close();
+      const lookup = await store.getAtomicCreateReceipt(VALID_UUID);
+      expect(lookup.receipt).toMatchObject({
+        schema_version: 1,
+        id: VALID_UUID,
+        correlation_key: VALID_KEY,
+        card_id: OTHER_UUID,
+        outcome: "created",
+        reason_code: "workboard_card_created",
+        detail_code: null,
+      });
+    } finally {
+      stores.close();
+    }
+  });
 });

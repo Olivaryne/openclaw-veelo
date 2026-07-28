@@ -20,6 +20,7 @@ import {
   verifyContractReferences,
   verifyExactHead,
   verifyExtractedTree,
+  verifyPullRequest,
   writeReceiptArtifacts,
 } from "./openclaw-ci.mjs";
 
@@ -48,7 +49,7 @@ function validReceipt() {
   return {
     schema_version: "openclaw-ci-receipt/1",
     repository: "Olivaryne/openclaw-veelo",
-    pull_request_number: 3,
+    pull_request_number: 7,
     base_sha: "a".repeat(40),
     head_sha: "b".repeat(40),
     actual_checked_out_sha: "b".repeat(40),
@@ -111,6 +112,19 @@ test("valid target manifest is closed and accepted", () => {
   assert.equal(validateTargetManifest(clone(manifest)).target_id, "AUT-WB-ATOMIC-SRV-1");
 });
 
+test("governed target is rebound to replacement PR #7 with everything else preserved", () => {
+  // CI-OPENCLAW-002: superseded canary PR #3 (feat/aut-wb-atomic-srv-1) is
+  // replaced by PR #7 on its proof branch; every other governed identity
+  // field stays frozen.
+  assert.equal(manifest.repository, "Olivaryne/openclaw-veelo");
+  assert.equal(manifest.pull_request_number, 7);
+  assert.equal(manifest.base_branch, "veelo-main");
+  assert.equal(manifest.implementation_branch, "proof/aut-wb-atomic-srv-1-a22-a25");
+  assert.equal(manifest.implementation_base_sha, "ff2131e587645d473d3328831e42a50e3529ed38");
+  assert.equal(manifest.rollback_package.version, "2026.7.1-2");
+  assert.equal(permittedFiles.length, 7);
+});
+
 test("malformed target manifest fails closed", () => {
   const value = clone(manifest);
   value.parent_contract.commit_sha = "1234";
@@ -137,6 +151,181 @@ test("unauthorized governed file is rejected", () => {
 test("dependency-file drift is rejected", () => {
   const files = [...permittedFiles.slice(0, -1), "package.json"];
   assert.throws(() => validateGovernedScope(manifest, files), /file budget mismatch/);
+});
+
+test("workflow drift is rejected", () => {
+  const files = [...permittedFiles.slice(0, -1), ".github/workflows/openclaw-veelo-ci.yml"];
+  assert.throws(() => validateGovernedScope(manifest, files), /file budget mismatch/);
+});
+
+test("deployment-file drift is rejected", () => {
+  const files = [...permittedFiles.slice(0, -1), "deploy/production.yaml"];
+  assert.throws(() => validateGovernedScope(manifest, files), /file budget mismatch/);
+});
+
+// Synthetic PR history for governed classification: an implementation-base
+// commit, a seven-file implementation commit, and an A22/A25-style proof
+// commit that stays inside the already-governed store.test.ts path. The
+// fixture manifest pins implementation_base_sha to the fixture base so the
+// real merge-base rules are exercised against real git history.
+function makeGovernedPrRepo({ omitFile, extraFile } = {}) {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-governed-pr-")));
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: "fixture",
+    GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+    GIT_COMMITTER_NAME: "fixture",
+    GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+  };
+  const run = (args) => execFileSync("git", args, { cwd: dir, encoding: "utf8", env });
+  run(["init", "-q"]);
+  for (const file of permittedFiles) {
+    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+    fs.writeFileSync(path.join(dir, file), `// ${file} base fixture\n`);
+  }
+  fs.writeFileSync(path.join(dir, "README.md"), "governed PR fixture\n");
+  run(["add", "."]);
+  run(["commit", "-qm", "implementation base fixture"]);
+  const baseSha = run(["rev-parse", "HEAD"]).trim();
+  for (const file of permittedFiles) {
+    if (file !== omitFile) {
+      fs.appendFileSync(path.join(dir, file), "// implementation fixture change\n");
+    }
+  }
+  if (extraFile) {
+    fs.mkdirSync(path.dirname(path.join(dir, extraFile)), { recursive: true });
+    fs.writeFileSync(path.join(dir, extraFile), "// out-of-budget fixture file\n");
+  }
+  run(["add", "."]);
+  run(["commit", "-qm", "implementation fixture"]);
+  fs.appendFileSync(
+    path.join(dir, "extensions/workboard/src/store.test.ts"),
+    "// A22/A25 proof fixture change\n",
+  );
+  run(["add", "."]);
+  run(["commit", "-qm", "A22/A25 proof fixture"]);
+  const headSha = run(["rev-parse", "HEAD"]).trim();
+  const fixtureManifest = clone(manifest);
+  fixtureManifest.implementation_base_sha = baseSha;
+  return { dir, baseSha, headSha, fixtureManifest };
+}
+
+function verifyFixturePullRequest(fixture, overrides = {}) {
+  return verifyPullRequest({
+    sourceDir: fixture.dir,
+    manifest: fixture.fixtureManifest,
+    repository: manifest.repository,
+    prNumber: manifest.pull_request_number,
+    baseBranch: manifest.base_branch,
+    headBranch: manifest.implementation_branch,
+    eventBaseSha: fixture.baseSha,
+    expectedHeadSha: fixture.headSha,
+    ...overrides,
+  });
+}
+
+test("replacement PR #7 on its exact branch is governed", () => {
+  const fixture = makeGovernedPrRepo();
+  try {
+    const result = verifyFixturePullRequest(fixture);
+    assert.equal(result.governed, true);
+    assert.equal(result.pull_request_number, 7);
+    assert.equal(result.actual_checked_out_sha, fixture.headSha);
+    assert.equal(result.merge_base_sha, fixture.baseSha);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true });
+  }
+});
+
+test("PR #7 on the wrong branch is generic, never governed", () => {
+  const fixture = makeGovernedPrRepo();
+  try {
+    const result = verifyFixturePullRequest(fixture, { headBranch: "feat/aut-wb-atomic-srv-1" });
+    assert.equal(result.governed, false);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true });
+  }
+});
+
+test("superseded canary PR #3 is no longer governed", () => {
+  const fixture = makeGovernedPrRepo();
+  try {
+    const oldTarget = verifyFixturePullRequest(fixture, {
+      prNumber: 3,
+      headBranch: "feat/aut-wb-atomic-srv-1",
+    });
+    assert.equal(oldTarget.governed, false);
+    const oldNumberOnly = verifyFixturePullRequest(fixture, { prNumber: 3 });
+    assert.equal(oldNumberOnly.governed, false);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true });
+  }
+});
+
+test("wrong PR number is not governed", () => {
+  const fixture = makeGovernedPrRepo();
+  try {
+    assert.equal(verifyFixturePullRequest(fixture, { prNumber: 8 }).governed, false);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true });
+  }
+});
+
+test("wrong repository is not governed", () => {
+  const fixture = makeGovernedPrRepo();
+  try {
+    const result = verifyFixturePullRequest(fixture, { repository: "Olivaryne/veelo" });
+    assert.equal(result.governed, false);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true });
+  }
+});
+
+test("governed PR with the wrong implementation base refuses", () => {
+  const fixture = makeGovernedPrRepo();
+  try {
+    fixture.fixtureManifest.implementation_base_sha = "f".repeat(40);
+    assert.throws(() => verifyFixturePullRequest(fixture), /does not equal implementation base/);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true });
+  }
+});
+
+test("governed PR with an extra changed file refuses", () => {
+  const fixture = makeGovernedPrRepo({ extraFile: "extensions/workboard/src/extra-helper.ts" });
+  try {
+    assert.throws(() => verifyFixturePullRequest(fixture), /file budget mismatch/);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true });
+  }
+});
+
+test("governed PR missing a governed file refuses", () => {
+  const fixture = makeGovernedPrRepo({ omitFile: "extensions/workboard/src/gateway.ts" });
+  try {
+    assert.throws(() => verifyFixturePullRequest(fixture), /file budget mismatch/);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true });
+  }
+});
+
+test("A22/A25 proof changes in governed store.test.ts stay within the seven-file budget", () => {
+  const fixture = makeGovernedPrRepo();
+  try {
+    const result = verifyFixturePullRequest(fixture);
+    assert.equal(result.governed, true);
+    const changed = execFileSync(
+      "git",
+      ["diff", "--name-only", `${fixture.baseSha}...${fixture.headSha}`],
+      { cwd: fixture.dir, encoding: "utf8" },
+    )
+      .trim()
+      .split("\n");
+    const byPath = (left, right) => (left < right ? -1 : left > right ? 1 : 0);
+    assert.deepEqual(changed.toSorted(byPath), [...permittedFiles].toSorted(byPath));
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true });
+  }
 });
 
 test("valid workflow passes the narrow static policy", () => {
@@ -810,6 +999,33 @@ test("remediation surface contains no disclosure-shaped content", () => {
 
 test("valid receipt is accepted", () => {
   assert.equal(validateReceipt(validReceipt(), manifest).final_conclusion, "success");
+});
+
+test("receipt identity binds replacement PR #7 and its exact head", () => {
+  const accepted = validateReceipt(validReceipt(), manifest);
+  assert.equal(accepted.pull_request_number, 7);
+  assert.equal(accepted.repository, "Olivaryne/openclaw-veelo");
+  assert.equal(accepted.head_sha, accepted.actual_checked_out_sha);
+});
+
+test("generic and superseded PR numbers cannot mint a governed receipt", () => {
+  for (const number of [3, 4, 12345]) {
+    const value = validReceipt();
+    value.pull_request_number = number;
+    assert.throws(() => validateReceipt(value, manifest), /pull request target mismatch/);
+  }
+});
+
+test("failed mandatory job blocks the governed receipt", () => {
+  const value = validReceipt();
+  value.jobs[0].conclusion = "failure";
+  assert.throws(() => validateReceipt(value, manifest), /did not succeed/);
+});
+
+test("missing mandatory job blocks the governed receipt", () => {
+  const value = validReceipt();
+  value.jobs.pop();
+  assert.throws(() => validateReceipt(value, manifest), /every mandatory job exactly once/);
 });
 
 test("malformed receipt with unknown fields is rejected", () => {

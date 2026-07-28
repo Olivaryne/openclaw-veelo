@@ -2,9 +2,9 @@
   "schema_version": "openclaw-ci-target/1",
   "target_id": "AUT-WB-ATOMIC-SRV-1",
   "repository": "Olivaryne/openclaw-veelo",
-  "pull_request_number": 3,
+  "pull_request_number": 7,
   "base_branch": "veelo-main",
-  "implementation_branch": "feat/aut-wb-atomic-srv-1",
+  "implementation_branch": "proof/aut-wb-atomic-srv-1-a22-a25",
   "implementation_base_sha": "ff2131e587645d473d3328831e42a50e3529ed38",
   "parent_contract": {
     "repository": "Olivaryne/veelo",

@@ -5,6 +5,8 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { MAX_DATE_TIMESTAMP_MS } from "openclaw/plugin-sdk/number-runtime";
 import { describe, expect, it, vi } from "vitest";
+import type { OpenClawPluginApi } from "../api.js";
+import { registerWorkboardGatewayMethods } from "./gateway.js";
 import { createWorkboardSqliteStores } from "./sqlite-store.js";
 import {
   WorkboardStore,
@@ -2734,5 +2736,1693 @@ describe("WorkboardStore", () => {
     await expect(store.create({ title: "Bad card", status: "later" })).rejects.toThrow(
       /status must be one of/,
     );
+  });
+});
+
+// ---- AUT-WB-ATOMIC server boundary (contract aut-wb-atomic/1, child aut-wb-atomic-server/1)
+
+import { createHash } from "node:crypto";
+import {
+  atomicCardNotes,
+  atomicCardTitle,
+  atomicSpecFingerprint,
+  buildAtomicEnvelope,
+  canonicalAtomicJson,
+  deriveAtomicOccurrenceKey,
+  isAtomicCorrelationKey,
+  validateAtomicCreateRequest,
+} from "./store.js";
+import type { AtomicCreateResponseV1, CanonicalAutomationCardSpecV1 } from "./types.js";
+
+const FROZEN_KEY = "occ_v1_7a80f585e84b83e031d3eb8823faaee0";
+const FROZEN_FINGERPRINT =
+  "sha256:952ae4aac535d4220eea7ec6d33c065cb80446e1924c922861802eff62773c6b";
+// Complete frozen canonical byte string for the parent contract §3.2 example. The
+// assertion below is byte-exact on purpose: a placeholder or self-derived expectation
+// does not satisfy the §3.4 vector.
+const FROZEN_CANONICAL_JSON =
+  '{"automation":{"approval_policy":"operator-required","automation_id":"aut-test.daily-brief","occurrence_key":"occ_v1_7a80f585e84b83e031d3eb8823faaee0","output_contract_ref":"contracts/output/daily-brief@1","risk_class":"read-only","schedule_revision":1,"scheduled_at":"2026-08-03T12:00:00.000Z","skill_name":"workboard-worker","skill_version":"1.2.0","verification_contract_ref":"contracts/verify/daily-brief@1"},"board":{"id":"test-board","lane":"automation","ref":"board:test-board","template_ref":null},"execution_control":{"assignee_id":null,"claim_owner_id":null,"execution_authorized":false,"execution_id":null},"initial_status":"backlog","labels":["automation","hold","operator-merge-only"],"notes":"Governed automation occurrence; occurrence_key=occ_v1_7a80f585e84b83e031d3eb8823faaee0; automation_id=aut-test.daily-brief; schedule_revision=1; scheduled_at=2026-08-03T12:00:00.000Z; skill=workboard-worker@1.2.0; risk_class=read-only; approval_policy=operator-required; output_contract_ref=contracts/output/daily-brief@1; verification_contract_ref=contracts/verify/daily-brief@1; held=true; operator_controlled=true; execution_authorized=false.","priority":"normal","schema_version":1,"title":"Automation aut-test.daily-brief @ 2026-08-03T12:00:00.000Z"}';
+
+type AtomicSpecOverrides = {
+  automation?: Partial<CanonicalAutomationCardSpecV1["automation"]>;
+  top?: Partial<Record<string, unknown>>;
+};
+
+function makeAtomicSpec(
+  automationId = "aut-test.daily-brief",
+  scheduledAt = "2026-08-03T12:00:00.000Z",
+  rev = 1,
+  overrides: AtomicSpecOverrides = {},
+): { key: string; spec: CanonicalAutomationCardSpecV1 } {
+  const automation = {
+    occurrence_key: deriveAtomicOccurrenceKey(automationId, rev, scheduledAt),
+    automation_id: automationId,
+    schedule_revision: rev,
+    scheduled_at: scheduledAt,
+    skill_name: "workboard-worker",
+    skill_version: "1.2.0",
+    risk_class: "read-only" as const,
+    approval_policy: "operator-required" as const,
+    output_contract_ref: "contracts/output/daily-brief@1",
+    verification_contract_ref: "contracts/verify/daily-brief@1",
+    ...overrides.automation,
+  };
+  const spec = {
+    schema_version: 1,
+    board: { id: "test-board", ref: "board:test-board", lane: "automation", template_ref: null },
+    title: atomicCardTitle(automation.automation_id, automation.scheduled_at),
+    initial_status: "backlog",
+    priority: "normal",
+    labels: ["automation", "hold", "operator-merge-only"],
+    notes: atomicCardNotes(automation),
+    automation,
+    execution_control: {
+      assignee_id: null,
+      claim_owner_id: null,
+      execution_id: null,
+      execution_authorized: false,
+    },
+    ...overrides.top,
+  } as CanonicalAutomationCardSpecV1;
+  return { key: automation.occurrence_key, spec };
+}
+
+function openAtomicFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wb-atomic-store-"));
+  const dbPath = path.join(dir, "workboard.sqlite");
+  const stores = createWorkboardSqliteStores({ dbPath });
+  const store = new WorkboardStore(stores.cards, {
+    boards: stores.boards,
+    subscriptions: stores.subscriptions,
+    attachments: stores.attachments,
+  });
+  return {
+    dir,
+    dbPath,
+    stores,
+    store,
+    close() {
+      stores.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+type AtomicGatewayHandler = Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1];
+
+function captureAtomicGatewayHandler(store: WorkboardStore): AtomicGatewayHandler {
+  const methods = new Map<string, AtomicGatewayHandler>();
+  const api = {
+    registerGatewayMethod: vi.fn((method: string, handler: AtomicGatewayHandler) => {
+      methods.set(method, handler);
+    }),
+  } as unknown as OpenClawPluginApi;
+  registerWorkboardGatewayMethods({ api, store });
+  const handler = methods.get("workboard.cards.createOrRecoverByCorrelationKey");
+  expect(handler).toBeDefined();
+  return handler as AtomicGatewayHandler;
+}
+
+async function invokeAtomicGateway(
+  handler: AtomicGatewayHandler,
+  params: Record<string, unknown>,
+): Promise<AtomicCreateResponseV1> {
+  const respond = vi.fn();
+  await handler({ params, respond } as never);
+  expect(respond).toHaveBeenCalledOnce();
+  expect(respond.mock.calls[0]?.[0]).toBe(true);
+  return respond.mock.calls[0]?.[1] as AtomicCreateResponseV1;
+}
+
+const PROHIBITED_ATOMIC_EFFECT_METHODS = [
+  "list",
+  "get",
+  "create",
+  "update",
+  "bulkUpdate",
+  "move",
+  "delete",
+  "claim",
+  "heartbeat",
+  "releaseClaim",
+  "promote",
+  "promoteReady",
+  "reassign",
+  "reclaim",
+  "complete",
+  "block",
+  "unblock",
+  "dispatch",
+] as const;
+
+function poisonProhibitedAtomicEffects(store: WorkboardStore) {
+  return PROHIBITED_ATOMIC_EFFECT_METHODS.map((method) =>
+    vi
+      .spyOn(store as unknown as Record<string, (...args: never[]) => unknown>, method)
+      .mockImplementation(() => {
+        throw new Error(`prohibited atomic effect reached: ${method}`);
+      }),
+  );
+}
+
+function poisonGenericStoreFallbacks(store: {
+  register: (...args: never[]) => unknown;
+  lookup: (...args: never[]) => unknown;
+  delete: (...args: never[]) => unknown;
+  entries: (...args: never[]) => unknown;
+}) {
+  return (["register", "lookup", "delete", "entries"] as const).map((method) =>
+    vi.spyOn(store, method).mockImplementation(() => {
+      throw new Error(`generic store fallback reached: ${method}`);
+    }),
+  );
+}
+
+// Full no-mutation oracle: the card row plus EVERY child-data surface (all twelve
+// child tables) and attachment blob bytes.
+const RAW_DIGEST_CHILD_TABLES = [
+  "workboard_card_labels",
+  "workboard_card_events",
+  "workboard_card_attempts",
+  "workboard_card_comments",
+  "workboard_card_links",
+  "workboard_card_proof",
+  "workboard_card_artifacts",
+  "workboard_card_attachments",
+  "workboard_card_diagnostics",
+  "workboard_card_notifications",
+  "workboard_worker_logs",
+  "workboard_worker_protocol",
+] as const;
+
+function rawDigest(dbPath: string, cardId: string): string {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const card = db.prepare("SELECT * FROM workboard_cards WHERE id = ?").get(cardId);
+    const children = RAW_DIGEST_CHILD_TABLES.map((table) =>
+      db.prepare(`SELECT * FROM ${table} WHERE card_id = ? ORDER BY rowid`).all(cardId),
+    );
+    const attachmentBlobs = db
+      .prepare(
+        `
+          SELECT a.id AS attachment_id, hex(b.content) AS content_hex
+          FROM workboard_card_attachments a
+          JOIN workboard_attachment_blobs b ON b.attachment_id = a.id
+          WHERE a.card_id = ? ORDER BY a.id
+        `,
+      )
+      .all(cardId);
+    return JSON.stringify({ card, children, attachmentBlobs }, (_key, value) =>
+      typeof value === "bigint" ? Number(value) : value,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function receiptCount(dbPath: string, key: string): number {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM workboard_atomic_create_receipts WHERE correlation_key = ?",
+      )
+      .get(key) as { n: number | bigint };
+    return Number(row.n);
+  } finally {
+    db.close();
+  }
+}
+
+function totalReceiptCount(dbPath: string): number {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db.prepare("SELECT COUNT(*) AS n FROM workboard_atomic_create_receipts").get() as {
+      n: number | bigint;
+    };
+    return Number(row.n);
+  } finally {
+    db.close();
+  }
+}
+
+// Corrupting stored records requires bypassing the immutability trigger the way a
+// hostile writer would, then restoring the trigger so the schema stays complete.
+function corruptCorrelatedRow(dbPath: string, mutate: (db: DatabaseSync) => void): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec("DROP TRIGGER workboard_cards_atomic_tuple_immutable");
+    db.exec("DROP TRIGGER workboard_cards_atomic_tuple_complete_update");
+    mutate(db);
+    db.exec(`
+      CREATE TRIGGER workboard_cards_atomic_tuple_complete_update
+      BEFORE UPDATE ON workboard_cards
+      WHEN NOT (
+        (
+          NEW.correlation_key IS NULL
+          AND NEW.governance_spec_version IS NULL
+          AND NEW.governance_spec_json IS NULL
+          AND NEW.governance_fingerprint IS NULL
+        )
+        OR
+        (
+          NEW.correlation_key IS NOT NULL
+          AND NEW.governance_spec_version IS NOT NULL
+          AND NEW.governance_spec_json IS NOT NULL
+          AND NEW.governance_fingerprint IS NOT NULL
+        )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'atomic governance tuple must be complete');
+      END;
+      CREATE TRIGGER workboard_cards_atomic_tuple_immutable
+      BEFORE UPDATE ON workboard_cards
+      WHEN OLD.correlation_key IS NOT NULL AND (
+        NEW.correlation_key IS NOT OLD.correlation_key
+        OR NEW.governance_spec_version IS NOT OLD.governance_spec_version
+        OR NEW.governance_spec_json IS NOT OLD.governance_spec_json
+        OR NEW.governance_fingerprint IS NOT OLD.governance_fingerprint
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'atomic governance tuple is immutable');
+      END;
+    `);
+  } finally {
+    db.close();
+  }
+}
+
+describe("AUT-WB-ATOMIC frozen vectors", () => {
+  it("derives the frozen occurrence key from the frozen material", () => {
+    expect(deriveAtomicOccurrenceKey("aut-test.daily-brief", 1, "2026-08-03T12:00:00.000Z")).toBe(
+      FROZEN_KEY,
+    );
+    const material = "veelo-aut-occ|v1|aut-test.daily-brief|rev1|2026-08-03T12:00:00.000Z";
+    expect(
+      `occ_v1_${createHash("sha256").update(material, "utf8").digest("hex").slice(0, 32)}`,
+    ).toBe(FROZEN_KEY);
+  });
+
+  it("canonicalizes the §3.2 example to the exact frozen byte string and fingerprint", () => {
+    const { key, spec } = makeAtomicSpec();
+    expect(key).toBe(FROZEN_KEY);
+    const validated = validateAtomicCreateRequest(key, spec);
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) {
+      return;
+    }
+    expect(validated.canonicalJson).toBe(FROZEN_CANONICAL_JSON);
+    expect(validated.fingerprint).toBe(FROZEN_FINGERPRINT);
+    expect(atomicSpecFingerprint(FROZEN_CANONICAL_JSON)).toBe(FROZEN_FINGERPRINT);
+  });
+
+  it("one-byte mutations change the digest and one-field mutations change the fingerprint", () => {
+    const flipped = `${FROZEN_CANONICAL_JSON.slice(0, 100)}${
+      FROZEN_CANONICAL_JSON[100] === "a" ? "b" : "a"
+    }${FROZEN_CANONICAL_JSON.slice(101)}`;
+    expect(atomicSpecFingerprint(flipped)).not.toBe(FROZEN_FINGERPRINT);
+    const mutated = makeAtomicSpec("aut-test.daily-brief", "2026-08-03T12:00:00.000Z", 1, {
+      automation: { skill_version: "1.2.1" },
+    });
+    const validated = validateAtomicCreateRequest(mutated.key, mutated.spec);
+    expect(validated.ok).toBe(true);
+    if (validated.ok) {
+      expect(validated.fingerprint).not.toBe(FROZEN_FINGERPRINT);
+    }
+  });
+
+  it("isAtomicCorrelationKey enforces the frozen grammar", () => {
+    expect(isAtomicCorrelationKey(FROZEN_KEY)).toBe(true);
+    for (const bad of [
+      null,
+      42,
+      "occ_v1_",
+      "occ_v2_7a80f585e84b83e031d3eb8823faaee0",
+      "occ_v1_7A80F585E84B83E031D3EB8823FAAEE0",
+      `${FROZEN_KEY}0`,
+      FROZEN_KEY.slice(0, 38),
+    ]) {
+      expect(isAtomicCorrelationKey(bad)).toBe(false);
+    }
+  });
+});
+
+describe("AUT-WB-ATOMIC request validation (A14-A22)", () => {
+  function expectInvalid(key: unknown, spec: unknown, expectedKeyEcho?: string | null) {
+    const result = validateAtomicCreateRequest(key, spec);
+    expect(result.ok).toBe(false);
+    if (!result.ok && expectedKeyEcho !== undefined) {
+      expect(result.correlationKey).toBe(expectedKeyEcho);
+    }
+  }
+
+  it("accepts only the exact closed shape", () => {
+    const { key, spec } = makeAtomicSpec();
+    expect(validateAtomicCreateRequest(key, spec).ok).toBe(true);
+  });
+
+  it("rejects malformed keys and non-object specs with a null key echo when key-invalid", () => {
+    const { key, spec } = makeAtomicSpec();
+    expectInvalid(null, spec, null);
+    expectInvalid("occ_v1_zzz", spec, null);
+    expectInvalid(key, null, key);
+    expectInvalid(key, [], key);
+    expectInvalid(key, "spec", key);
+  });
+
+  it("rejects unknown and missing fields at every level (A22)", () => {
+    const { key, spec } = makeAtomicSpec();
+    const levels: Array<[string, (clone: Record<string, any>) => void]> = [
+      ["top unknown", (c) => (c.extra = 1)],
+      ["top missing", (c) => delete c.priority],
+      ["board unknown", (c) => (c.board.extra = 1)],
+      ["board missing", (c) => delete c.board.lane],
+      ["automation unknown", (c) => (c.automation.extra = 1)],
+      ["automation missing", (c) => delete c.automation.skill_name],
+      ["execution unknown", (c) => (c.execution_control.extra = 1)],
+      ["execution missing", (c) => delete c.execution_control.execution_id],
+    ];
+    for (const [, mutate] of levels) {
+      const clone = structuredClone(spec) as Record<string, any>;
+      mutate(clone);
+      expectInvalid(key, clone, key);
+    }
+  });
+
+  it("rejects each fixed and derived field mutation (A14-A17)", () => {
+    const { key, spec } = makeAtomicSpec();
+    const mutations: Array<(clone: Record<string, any>) => void> = [
+      (c) => (c.title = "Tampered title"),
+      (c) => (c.initial_status = "todo"),
+      (c) => (c.priority = "high"),
+      (c) => (c.labels = ["automation", "hold", "operator-merge-only", "extra"]),
+      (c) => (c.labels = ["automation", "hold"]),
+      (c) => (c.labels = ["hold", "automation", "operator-merge-only"]),
+      (c) => (c.notes = `${c.notes} tampered`),
+      (c) => (c.execution_control.assignee_id = "agent-1"),
+      (c) => (c.execution_control.claim_owner_id = "owner-1"),
+      (c) => (c.execution_control.execution_id = "exec-1"),
+      (c) => (c.execution_control.execution_authorized = true),
+      (c) => (c.schema_version = 2),
+    ];
+    for (const mutate of mutations) {
+      const clone = structuredClone(spec) as Record<string, any>;
+      mutate(clone);
+      expectInvalid(key, clone, key);
+    }
+  });
+
+  it("rejects occurrence-key derivation mismatches (A18-A20)", () => {
+    const base = makeAtomicSpec();
+    // Same external key, changed automation identity fields with re-derived title/notes.
+    const changedId = makeAtomicSpec("aut-test.other-brief");
+    const changedIdSpec = structuredClone(changedId.spec) as Record<string, any>;
+    changedIdSpec.automation.occurrence_key = base.key;
+    changedIdSpec.notes = atomicCardNotes(changedIdSpec.automation);
+    expectInvalid(base.key, changedIdSpec, base.key);
+    const changedRev = makeAtomicSpec("aut-test.daily-brief", "2026-08-03T12:00:00.000Z", 2);
+    const changedRevSpec = structuredClone(changedRev.spec) as Record<string, any>;
+    changedRevSpec.automation.occurrence_key = base.key;
+    changedRevSpec.notes = atomicCardNotes(changedRevSpec.automation);
+    expectInvalid(base.key, changedRevSpec, base.key);
+    const changedAt = makeAtomicSpec("aut-test.daily-brief", "2026-08-03T13:00:00.000Z");
+    const changedAtSpec = structuredClone(changedAt.spec) as Record<string, any>;
+    changedAtSpec.automation.occurrence_key = base.key;
+    changedAtSpec.notes = atomicCardNotes(changedAtSpec.automation);
+    expectInvalid(base.key, changedAtSpec, base.key);
+    // Key/spec disagreement in either direction.
+    const clone = structuredClone(base.spec) as Record<string, any>;
+    expectInvalid(changedAt.key, clone, changedAt.key);
+  });
+
+  it("rejects grammar, namespace, policy-matrix, timestamp, and secret-shape violations", () => {
+    const { key, spec } = makeAtomicSpec();
+    const cases: Array<(clone: Record<string, any>) => void> = [
+      (c) => (c.board.id = "Bad_Board"),
+      (c) => (c.board.ref = "board:other-board"),
+      (c) => (c.board.lane = "UPPER"),
+      (c) => (c.board.template_ref = "contracts/output/x@1"),
+      (c) => (c.board.template_ref = "workboard:template/"),
+      (c) => (c.automation.skill_name = "Bad Skill"),
+      (c) => (c.automation.skill_version = "1.2"),
+      (c) => (c.automation.risk_class = "critical"),
+      (c) => (c.automation.approval_policy = "self-approved"),
+      (c) => {
+        c.automation.risk_class = "external-effect";
+        c.automation.approval_policy = "auto-within-risk-class";
+        c.notes = atomicCardNotes(c.automation);
+      },
+      (c) => (c.automation.output_contract_ref = "contracts/verify/daily-brief@1"),
+      (c) => (c.automation.verification_contract_ref = "contracts/output/daily-brief@1"),
+      (c) => (c.automation.output_contract_ref = "reports/output/daily-brief@1"),
+      (c) => (c.automation.schedule_revision = 0),
+      (c) => (c.automation.schedule_revision = 1.5),
+    ];
+    for (const mutate of cases) {
+      const clone = structuredClone(spec) as Record<string, any>;
+      mutate(clone);
+      expectInvalid(key, clone, key);
+    }
+    // Non-canonical timestamp with a consistently derived key is still invalid.
+    const nonCanonical = "2026-08-03T12:00:00Z";
+    const derived = deriveAtomicOccurrenceKey("aut-test.daily-brief", 1, nonCanonical);
+    const clone = structuredClone(spec) as Record<string, any>;
+    clone.automation.scheduled_at = nonCanonical;
+    clone.automation.occurrence_key = derived;
+    clone.title = atomicCardTitle("aut-test.daily-brief", nonCanonical);
+    clone.notes = atomicCardNotes(clone.automation);
+    expectInvalid(derived, clone, derived);
+    // Token-shaped reference value is refused by the deep secret scan.
+    const secretClone = structuredClone(spec) as Record<string, any>;
+    const tokenShape = ["ghp", "A".repeat(20)].join("_");
+    secretClone.board.template_ref = `workboard:template/${tokenShape}`;
+    expectInvalid(key, secretClone, key);
+  });
+});
+
+describe("AUT-WB-ATOMIC A22 closed-request persisted-invariant proof", () => {
+  type A22Case = {
+    label: string;
+    expectedCorrelationKey: string | null;
+    params: (key: string, spec: CanonicalAutomationCardSpecV1) => Record<string, unknown>;
+  };
+
+  function mutatedSpec(
+    spec: CanonicalAutomationCardSpecV1,
+    mutate: (clone: Record<string, any>) => void,
+  ): Record<string, unknown> {
+    const clone = structuredClone(spec) as Record<string, any>;
+    mutate(clone);
+    return clone;
+  }
+
+  it("rejects unknown and missing fields at every request/spec authority level before lookup or write", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(created.reason_code).toBe("workboard_card_created");
+      const cardId = created.card?.id as string;
+      const handler = captureAtomicGatewayHandler(fixture.store);
+      const invariantBefore = rawDigest(fixture.dbPath, cardId);
+      const receiptsBefore = totalReceiptCount(fixture.dbPath);
+      const atomicBoundarySpy = vi.spyOn(
+        fixture.stores.cards as unknown as {
+          atomicCreateOrRecover: (...args: never[]) => unknown;
+        },
+        "atomicCreateOrRecover",
+      );
+      const effectSpies = poisonProhibitedAtomicEffects(fixture.store);
+      const fallbackSpies = poisonGenericStoreFallbacks(fixture.stores.cards);
+      const cases: A22Case[] = [
+        {
+          label: "unknown top-level request field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: requestSpec,
+            unknown_request_field: true,
+          }),
+        },
+        {
+          label: "missing top-level correlationKey",
+          expectedCorrelationKey: null,
+          params: (_requestKey, requestSpec) => ({ cardSpec: requestSpec }),
+        },
+        {
+          label: "missing top-level cardSpec",
+          expectedCorrelationKey: key,
+          params: (requestKey) => ({ correlationKey: requestKey }),
+        },
+        {
+          label: "unknown cardSpec field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.unknown_spec_field = true;
+            }),
+          }),
+        },
+        {
+          label: "missing required cardSpec field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              delete clone.priority;
+            }),
+          }),
+        },
+        {
+          label: "unknown automation identity field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.automation.unknown_identity_field = true;
+            }),
+          }),
+        },
+        {
+          label: "missing required automation identity field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              delete clone.automation.automation_id;
+            }),
+          }),
+        },
+        {
+          label: "unknown board field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.board.unknown_board_field = true;
+            }),
+          }),
+        },
+        {
+          label: "missing required board field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              delete clone.board.template_ref;
+            }),
+          }),
+        },
+        {
+          label: "unknown execution_control field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.execution_control.unknown_execution_field = true;
+            }),
+          }),
+        },
+        {
+          label: "missing required execution_control field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              delete clone.execution_control.execution_authorized;
+            }),
+          }),
+        },
+        {
+          label: "unknown nested governance field",
+          expectedCorrelationKey: key,
+          params: (requestKey, requestSpec) => ({
+            correlationKey: requestKey,
+            cardSpec: mutatedSpec(requestSpec, (clone) => {
+              clone.automation.governance = { unknown_governance_field: true };
+            }),
+          }),
+        },
+      ];
+
+      for (const testCase of cases) {
+        const result = await invokeAtomicGateway(handler, testCase.params(key, spec));
+        expect(result, testCase.label).toEqual({
+          schema_version: 1,
+          ok: false,
+          outcome: "refused",
+          reason_code: "workboard_create_request_invalid",
+          retryable: false,
+          correlation_key: testCase.expectedCorrelationKey,
+          card: null,
+          stored_spec: null,
+          stored_fingerprint: null,
+          evidence: null,
+        });
+        expect(rawDigest(fixture.dbPath, cardId), testCase.label).toBe(invariantBefore);
+        expect(totalReceiptCount(fixture.dbPath), testCase.label).toBe(receiptsBefore);
+      }
+
+      expect(atomicBoundarySpy).not.toHaveBeenCalled();
+      for (const spy of [...effectSpies, ...fallbackSpies]) {
+        expect(spy).not.toHaveBeenCalled();
+        spy.mockRestore();
+      }
+    } finally {
+      vi.restoreAllMocks();
+      fixture.close();
+    }
+  });
+});
+
+describe("AUT-WB-ATOMIC recovery, conflicts, and refusals", () => {
+  it("A08: identical replay recovers without mutating the card or children", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(created.reason_code).toBe("workboard_card_created");
+      const cardId = created.card?.id as string;
+      const before = rawDigest(fixture.dbPath, cardId);
+      const recovered = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(recovered.reason_code).toBe("workboard_card_recovered");
+      expect(recovered.ok).toBe(true);
+      expect(recovered.card).toEqual(created.card);
+      expect(recovered.stored_spec).toEqual(created.stored_spec);
+      expect(recovered.stored_fingerprint).toBe(created.stored_fingerprint);
+      expect(recovered.evidence?.ref).not.toBe(created.evidence?.ref);
+      expect(rawDigest(fixture.dbPath, cardId)).toBe(before);
+      expect(receiptCount(fixture.dbPath, key)).toBe(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("A09-A13, A21: every valid governance mutation conflicts without mutation", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const base = makeAtomicSpec();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(base.key, base.spec);
+      const cardId = created.card?.id as string;
+      const before = rawDigest(fixture.dbPath, cardId);
+      const conflictOverrides: AtomicSpecOverrides[] = [
+        { automation: { risk_class: "draft-only" } },
+        { automation: { approval_policy: "auto-within-risk-class" } },
+        { automation: { skill_name: "other-worker" } },
+        { automation: { skill_version: "2.0.0" } },
+        { automation: { output_contract_ref: "contracts/output/daily-brief@2" } },
+        { automation: { verification_contract_ref: "contracts/verify/daily-brief@2" } },
+        {
+          top: {
+            board: {
+              id: "other-board",
+              ref: "board:other-board",
+              lane: "automation",
+              template_ref: null,
+            },
+          },
+        },
+        {
+          top: {
+            board: { id: "test-board", ref: "board:test-board", lane: null, template_ref: null },
+          },
+        },
+        {
+          top: {
+            board: {
+              id: "test-board",
+              ref: "board:test-board",
+              lane: "automation",
+              template_ref: "workboard:template/daily",
+            },
+          },
+        },
+      ];
+      for (const overrides of conflictOverrides) {
+        const mutated = makeAtomicSpec(
+          "aut-test.daily-brief",
+          "2026-08-03T12:00:00.000Z",
+          1,
+          overrides,
+        );
+        const result = await fixture.store.createOrRecoverByCorrelationKey(base.key, mutated.spec);
+        expect(result.reason_code).toBe("workboard_card_conflict");
+        expect(result.ok).toBe(false);
+        expect(result.outcome).toBe("refused");
+        expect(result.retryable).toBe(false);
+        expect(result.card).toBeNull();
+        expect(result.stored_spec).toBeNull();
+        expect(result.stored_fingerprint).toBe(created.stored_fingerprint);
+        expect(result.evidence?.kind).toBe("workboard_atomic_receipt");
+      }
+      expect(rawDigest(fixture.dbPath, cardId)).toBe(before);
+      // conflict receipts carry both fingerprints
+      const db = new DatabaseSync(fixture.dbPath);
+      try {
+        const rows = db
+          .prepare(
+            "SELECT request_fingerprint, stored_fingerprint FROM workboard_atomic_create_receipts WHERE reason_code = 'workboard_card_conflict'",
+          )
+          .all() as Array<{ request_fingerprint: string; stored_fingerprint: string }>;
+        expect(rows).toHaveLength(conflictOverrides.length);
+        for (const row of rows) {
+          expect(row.stored_fingerprint).toBe(created.stored_fingerprint);
+          expect(row.request_fingerprint).not.toBe(row.stored_fingerprint);
+        }
+      } finally {
+        db.close();
+      }
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("request-invalid precedence: an invalid same-key request never reaches comparison (A14 vs A21)", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      const cardId = created.card?.id as string;
+      const before = rawDigest(fixture.dbPath, cardId);
+      const receiptsBefore = receiptCount(fixture.dbPath, key);
+      const tampered = structuredClone(spec) as Record<string, any>;
+      tampered.title = "Tampered";
+      const result = await fixture.store.createOrRecoverByCorrelationKey(key, tampered);
+      expect(result.reason_code).toBe("workboard_create_request_invalid");
+      expect(result.correlation_key).toBe(key);
+      expect(result.card).toBeNull();
+      expect(result.stored_spec).toBeNull();
+      expect(result.stored_fingerprint).toBeNull();
+      expect(result.evidence).toBeNull();
+      expect(rawDigest(fixture.dbPath, cardId)).toBe(before);
+      expect(receiptCount(fixture.dbPath, key)).toBe(receiptsBefore);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("A23-A25: malformed, forged, or unknown-field stored records fail closed", async () => {
+    const cases: Array<{
+      detail: string;
+      corrupt: (db: DatabaseSync, cardId: string) => void;
+    }> = [
+      {
+        detail: "governance-spec-version-invalid",
+        corrupt: (db, cardId) =>
+          void db
+            .prepare("UPDATE workboard_cards SET governance_spec_version = 2 WHERE id = ?")
+            .run(cardId),
+      },
+      {
+        detail: "governance-spec-unreadable",
+        corrupt: (db, cardId) =>
+          void db
+            .prepare("UPDATE workboard_cards SET governance_spec_json = '{broken' WHERE id = ?")
+            .run(cardId),
+      },
+      {
+        detail: "governance-spec-invalid",
+        corrupt: (db, cardId) =>
+          void db
+            .prepare("UPDATE workboard_cards SET governance_spec_json = '{}' WHERE id = ?")
+            .run(cardId),
+      },
+      {
+        detail: "governance-spec-invalid",
+        corrupt: (db, cardId) => {
+          const row = db
+            .prepare("SELECT governance_spec_json FROM workboard_cards WHERE id = ?")
+            .get(cardId) as { governance_spec_json: string };
+          const spec = JSON.parse(row.governance_spec_json) as Record<string, unknown>;
+          spec.unknown_field = "x";
+          db.prepare("UPDATE workboard_cards SET governance_spec_json = ? WHERE id = ?").run(
+            JSON.stringify(spec),
+            cardId,
+          );
+        },
+      },
+      {
+        // A25 nested variant (Round-1 proof gap 3): the unknown field hides one
+        // level down, inside the automation object.
+        detail: "governance-spec-invalid",
+        corrupt: (db, cardId) => {
+          const row = db
+            .prepare("SELECT governance_spec_json FROM workboard_cards WHERE id = ?")
+            .get(cardId) as { governance_spec_json: string };
+          const spec = JSON.parse(row.governance_spec_json) as {
+            automation: Record<string, unknown>;
+          };
+          spec.automation.unknown_nested = "x";
+          db.prepare("UPDATE workboard_cards SET governance_spec_json = ? WHERE id = ?").run(
+            JSON.stringify(spec),
+            cardId,
+          );
+        },
+      },
+      {
+        detail: "governance-fingerprint-forged",
+        corrupt: (db, cardId) =>
+          void db
+            .prepare("UPDATE workboard_cards SET governance_fingerprint = ? WHERE id = ?")
+            .run(`sha256:${"0".repeat(64)}`, cardId),
+      },
+      {
+        detail: "governance-fingerprint-forged",
+        corrupt: (db, cardId) => {
+          // Spec changed, fingerprint left as originally expected.
+          const forged = makeAtomicSpec("aut-test.daily-brief", "2026-08-03T12:00:00.000Z", 1, {
+            automation: { skill_version: "3.0.0" },
+          });
+          db.prepare("UPDATE workboard_cards SET governance_spec_json = ? WHERE id = ?").run(
+            canonicalAtomicJson(forged.spec),
+            cardId,
+          );
+        },
+      },
+      {
+        detail: "governance-fingerprint-unreadable",
+        corrupt: (db, cardId) =>
+          void db
+            .prepare("UPDATE workboard_cards SET governance_fingerprint = 'garbage' WHERE id = ?")
+            .run(cardId),
+      },
+    ];
+    for (const testCase of cases) {
+      const fixture = openAtomicFixture();
+      try {
+        const { key, spec } = makeAtomicSpec();
+        const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        const cardId = created.card?.id as string;
+        corruptCorrelatedRow(fixture.dbPath, (db) => testCase.corrupt(db, cardId));
+        const before = rawDigest(fixture.dbPath, cardId);
+        const result = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(result.reason_code).toBe("workboard_stored_record_invalid");
+        expect(result.ok).toBe(false);
+        expect(result.outcome).toBe("refused");
+        expect(result.card).toBeNull();
+        expect(result.evidence?.kind).toBe("workboard_atomic_receipt");
+        expect(rawDigest(fixture.dbPath, cardId)).toBe(before);
+        const db = new DatabaseSync(fixture.dbPath);
+        try {
+          const receipt = db
+            .prepare(
+              "SELECT detail_code FROM workboard_atomic_create_receipts WHERE reason_code = 'workboard_stored_record_invalid' ORDER BY created_at DESC LIMIT 1",
+            )
+            .get() as { detail_code: string };
+          expect(receipt.detail_code).toBe(testCase.detail);
+        } finally {
+          db.close();
+        }
+      } finally {
+        fixture.close();
+      }
+    }
+  });
+
+  it("A26-A29: assigned, claimed, executing, started, completed, attempted, drifted, archived cards refuse", async () => {
+    const cases: Array<{
+      detail: string;
+      mutate: (db: DatabaseSync, cardId: string) => void;
+    }> = [
+      {
+        detail: "card-assigned",
+        mutate: (db, id) =>
+          void db.prepare("UPDATE workboard_cards SET agent_id = 'agent-1' WHERE id = ?").run(id),
+      },
+      {
+        detail: "card-claimed",
+        mutate: (db, id) =>
+          void db
+            .prepare(
+              'UPDATE workboard_cards SET claim_json = \'{"ownerId":"o","token":"t","claimedAt":1,"lastHeartbeatAt":1}\' WHERE id = ?',
+            )
+            .run(id),
+      },
+      {
+        detail: "card-executing",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_id = 'exec-1' WHERE id = ?")
+            .run(id),
+      },
+      // Every persisted execution field independently breaks pristine state
+      // (Round-1 defect 3), including the reviewer-reproduced execution_status case.
+      {
+        detail: "execution-kind-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_kind = 'agent-session' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-engine-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_engine = 'claude' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-mode-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_mode = 'autonomous' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-status-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_status = 'running' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-model-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_model = 'model-x' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-session-key-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_session_key = 'sess-1' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-run-id-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_run_id = 'run-1' WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-started-at-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_started_at = 7 WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "execution-updated-at-set",
+        mutate: (db, id) =>
+          void db
+            .prepare("UPDATE workboard_cards SET execution_updated_at = 7 WHERE id = ?")
+            .run(id),
+      },
+      {
+        detail: "status-not-backlog",
+        mutate: (db, id) =>
+          void db.prepare("UPDATE workboard_cards SET status = 'running' WHERE id = ?").run(id),
+      },
+      {
+        detail: "card-started",
+        mutate: (db, id) =>
+          void db.prepare("UPDATE workboard_cards SET started_at = 5 WHERE id = ?").run(id),
+      },
+      {
+        detail: "card-completed",
+        mutate: (db, id) =>
+          void db.prepare("UPDATE workboard_cards SET completed_at = 5 WHERE id = ?").run(id),
+      },
+      {
+        detail: "card-has-attempts",
+        mutate: (db, id) =>
+          void db
+            .prepare(
+              "INSERT INTO workboard_card_attempts (id, card_id, ordinal, status, started_at) VALUES ('a1', ?, 0, 'running', 1)",
+            )
+            .run(id),
+      },
+      {
+        detail: "labels-drift",
+        mutate: (db, id) =>
+          void db
+            .prepare(
+              "INSERT INTO workboard_card_labels (card_id, ordinal, label) VALUES (?, 3, 'extra')",
+            )
+            .run(id),
+      },
+      {
+        detail: "title-drift",
+        mutate: (db, id) =>
+          void db.prepare("UPDATE workboard_cards SET title = 'edited' WHERE id = ?").run(id),
+      },
+      {
+        detail: "notes-drift",
+        mutate: (db, id) =>
+          void db.prepare("UPDATE workboard_cards SET notes = 'edited' WHERE id = ?").run(id),
+      },
+      {
+        detail: "priority-drift",
+        mutate: (db, id) =>
+          void db.prepare("UPDATE workboard_cards SET priority = 'high' WHERE id = ?").run(id),
+      },
+      {
+        detail: "card-archived",
+        mutate: (db, id) =>
+          void db.prepare("UPDATE workboard_cards SET archived_at = 5 WHERE id = ?").run(id),
+      },
+    ];
+    for (const testCase of cases) {
+      const fixture = openAtomicFixture();
+      try {
+        const { key, spec } = makeAtomicSpec();
+        const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        const cardId = created.card?.id as string;
+        const db = new DatabaseSync(fixture.dbPath);
+        try {
+          testCase.mutate(db, cardId);
+        } finally {
+          db.close();
+        }
+        const before = rawDigest(fixture.dbPath, cardId);
+        const result = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(result.reason_code).toBe("workboard_card_state_incompatible");
+        expect(result.ok).toBe(false);
+        expect(result.outcome).toBe("refused");
+        expect(result.retryable).toBe(false);
+        expect(result.card).toBeNull();
+        expect(result.evidence?.kind).toBe("workboard_atomic_receipt");
+        expect(rawDigest(fixture.dbPath, cardId)).toBe(before);
+        const checkDb = new DatabaseSync(fixture.dbPath);
+        try {
+          const receipt = checkDb
+            .prepare(
+              "SELECT detail_code, card_id FROM workboard_atomic_create_receipts WHERE reason_code = 'workboard_card_state_incompatible' ORDER BY created_at DESC LIMIT 1",
+            )
+            .get() as { detail_code: string; card_id: string };
+          expect(receipt.detail_code).toBe(testCase.detail);
+          expect(receipt.card_id).toBe(cardId);
+        } finally {
+          checkDb.close();
+        }
+      } finally {
+        fixture.close();
+      }
+    }
+  });
+
+  it("A30: legacy same-key cards fail closed with no adoption", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      // One legacy card advertising the key through the generic create surface.
+      const legacy = await fixture.store.create({
+        title: "legacy occurrence card",
+        idempotencyKey: key,
+      });
+      const single = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(single.reason_code).toBe("workboard_incompatible_legacy_card");
+      expect(single.ok).toBe(false);
+      expect(single.outcome).toBe("refused");
+      expect(single.card).toBeNull();
+      expect(single.evidence?.kind).toBe("workboard_atomic_receipt");
+      // A second legacy advertiser on another board: closed count evidence, no card ids leak.
+      await fixture.store.create({
+        title: "legacy occurrence card two",
+        idempotencyKey: key,
+        boardId: "other-board",
+      });
+      const multiple = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(multiple.reason_code).toBe("workboard_incompatible_legacy_card");
+      const db = new DatabaseSync(fixture.dbPath);
+      try {
+        const rows = db
+          .prepare(
+            "SELECT card_id, detail_code FROM workboard_atomic_create_receipts WHERE reason_code = 'workboard_incompatible_legacy_card'",
+          )
+          .all() as Array<{ card_id: string | null; detail_code: string | null }>;
+        expect(rows).toHaveLength(2);
+        const singleCandidate = rows.find((row) => row.detail_code === null);
+        const multiCandidate = rows.find((row) => row.detail_code === "legacy-candidates-2");
+        expect(singleCandidate?.card_id).toBe(legacy.id);
+        expect(multiCandidate?.card_id).toBeNull();
+        const count = db
+          .prepare("SELECT COUNT(*) AS n FROM workboard_cards WHERE correlation_key IS NOT NULL")
+          .get() as { n: number | bigint };
+        expect(Number(count.n)).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("A30/A23: malformed legacy metadata and indexed/legacy mismatch fail closed", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      // Malformed legacy row that mentions the key inside unreadable metadata.
+      const db = new DatabaseSync(fixture.dbPath);
+      db.prepare(
+        `
+          INSERT INTO workboard_cards
+            (id, board_id, title, status, priority, position, created_at, updated_at, automation_json)
+          VALUES ('55555555-5555-4555-8555-555555555555', 'default', 'broken legacy', 'backlog', 'normal', 1, 1, 1, ?)
+        `,
+      ).run(`{"idempotencyKey": "${key}" BROKEN`);
+      db.close();
+      const malformed = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(malformed.reason_code).toBe("workboard_stored_record_invalid");
+      const db2 = new DatabaseSync(fixture.dbPath);
+      const receipt = db2
+        .prepare(
+          "SELECT detail_code FROM workboard_atomic_create_receipts ORDER BY created_at DESC LIMIT 1",
+        )
+        .get() as { detail_code: string };
+      db2.close();
+      expect(receipt.detail_code).toBe("legacy-metadata-malformed");
+      // Remove the malformed row; create the canonical card; then add a legacy
+      // advertiser: an indexed/legacy mismatch is stored-record invalidity.
+      const db3 = new DatabaseSync(fixture.dbPath);
+      db3
+        .prepare("DELETE FROM workboard_cards WHERE id = '55555555-5555-4555-8555-555555555555'")
+        .run();
+      db3.close();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(created.reason_code).toBe("workboard_card_created");
+      await fixture.store.create({ title: "late legacy advertiser", idempotencyKey: key });
+      const mismatch = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(mismatch.reason_code).toBe("workboard_stored_record_invalid");
+      const db4 = new DatabaseSync(fixture.dbPath);
+      const mismatchReceipt = db4
+        .prepare(
+          "SELECT detail_code FROM workboard_atomic_create_receipts WHERE detail_code = 'indexed-legacy-mismatch' LIMIT 1",
+        )
+        .get() as { detail_code: string };
+      db4.close();
+      expect(mismatchReceipt.detail_code).toBe("indexed-legacy-mismatch");
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("workboard_unavailable: a store without the SQLite atomic authority refuses with no fallback", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const { key, spec } = makeAtomicSpec();
+    expect(store.supportsAtomicCreate()).toBe(false);
+    const result = await store.createOrRecoverByCorrelationKey(key, spec);
+    expect(result.reason_code).toBe("workboard_unavailable");
+    expect(result.ok).toBe(false);
+    expect(result.outcome).toBe("failed");
+    expect(result.retryable).toBe(true);
+    expect(result.evidence).toBeNull();
+    // No fallback: nothing was created through the generic path.
+    expect(await store.list()).toHaveLength(0);
+    expect(await store.getAtomicCreateReceipt("44444444-4444-4444-8444-444444444444")).toEqual({
+      schema_version: 1,
+      receipt: null,
+    });
+  });
+
+  it("created cards are canonical, held, and generic surfaces see them on the right board", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(created.card).toMatchObject({
+        board_id: "test-board",
+        title: spec.title,
+        status: "backlog",
+        priority: "normal",
+        labels: ["automation", "hold", "operator-merge-only"],
+        notes: spec.notes,
+        agent_id: null,
+        claim: null,
+        execution: null,
+        started_at: null,
+        completed_at: null,
+        archived_at: null,
+      });
+      expect(created.card?.id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      expect(created.evidence?.ref).toMatch(
+        /^workboard:atomic-create-receipt\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      const generic = await fixture.store.get(created.card?.id as string);
+      expect(generic?.status).toBe("backlog");
+      expect(generic?.metadata?.automation?.boardId).toBe("test-board");
+      expect(generic?.metadata?.automation?.idempotencyKey).toBeUndefined();
+      const listed = await fixture.store.list({ boardId: "test-board" });
+      expect(listed.map((card) => card.id)).toContain(created.card?.id);
+    } finally {
+      fixture.close();
+    }
+  });
+});
+
+describe("AUT-WB-ATOMIC A25 persisted unknown-field proof", () => {
+  const cases: Array<{
+    label: string;
+    addUnknownField: (spec: Record<string, any>) => void;
+  }> = [
+    {
+      label: "root governance object",
+      addUnknownField: (spec) => {
+        spec.unknown_root_governance = true;
+      },
+    },
+    {
+      label: "automation governance object",
+      addUnknownField: (spec) => {
+        spec.automation.unknown_automation_governance = true;
+      },
+    },
+    {
+      label: "board authority object",
+      addUnknownField: (spec) => {
+        spec.board.unknown_board_governance = true;
+      },
+    },
+    {
+      label: "execution_control authority object",
+      addUnknownField: (spec) => {
+        spec.execution_control.unknown_execution_governance = true;
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(`${testCase.label}: returns exact stored-invalid evidence and preserves corrupt bytes plus every child surface`, async () => {
+      const fixture = openAtomicFixture();
+      try {
+        const { key, spec } = makeAtomicSpec();
+        const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(created.reason_code).toBe("workboard_card_created");
+        const cardId = created.card?.id as string;
+        const requestedFingerprint = created.stored_fingerprint as string;
+        corruptCorrelatedRow(fixture.dbPath, (db) => {
+          const row = db
+            .prepare("SELECT governance_spec_json FROM workboard_cards WHERE id = ?")
+            .get(cardId) as { governance_spec_json: string };
+          const persistedSpec = JSON.parse(row.governance_spec_json) as Record<string, any>;
+          testCase.addUnknownField(persistedSpec);
+          db.prepare("UPDATE workboard_cards SET governance_spec_json = ? WHERE id = ?").run(
+            JSON.stringify(persistedSpec),
+            cardId,
+          );
+        });
+        const corruptRowBefore = new DatabaseSync(fixture.dbPath);
+        const persistedBefore = corruptRowBefore
+          .prepare(
+            "SELECT governance_spec_json, governance_fingerprint FROM workboard_cards WHERE id = ?",
+          )
+          .get(cardId) as {
+          governance_spec_json: string;
+          governance_fingerprint: string;
+        };
+        corruptRowBefore.close();
+        expect(persistedBefore.governance_fingerprint).toBe(requestedFingerprint);
+        const invariantBefore = rawDigest(fixture.dbPath, cardId);
+        const receiptsBefore = receiptCount(fixture.dbPath, key);
+        const effectSpies = poisonProhibitedAtomicEffects(fixture.store);
+        const fallbackSpies = poisonGenericStoreFallbacks(fixture.stores.cards);
+
+        const result = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(result).toEqual({
+          schema_version: 1,
+          ok: false,
+          outcome: "refused",
+          reason_code: "workboard_stored_record_invalid",
+          retryable: false,
+          correlation_key: key,
+          card: null,
+          stored_spec: null,
+          stored_fingerprint: null,
+          evidence: {
+            kind: "workboard_atomic_receipt",
+            ref: expect.stringMatching(
+              /^workboard:atomic-create-receipt\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+            ),
+          },
+        });
+        const receiptId = result.evidence?.ref.split("/").pop() as string;
+        const lookup = await fixture.store.getAtomicCreateReceipt(receiptId);
+        expect(lookup.schema_version).toBe(1);
+        expect(Object.keys(lookup.receipt ?? {}).toSorted()).toEqual([
+          "card_id",
+          "correlation_key",
+          "created_at",
+          "detail_code",
+          "id",
+          "outcome",
+          "reason_code",
+          "request_fingerprint",
+          "schema_version",
+          "stored_fingerprint",
+        ]);
+        expect(lookup.receipt).toEqual({
+          schema_version: 1,
+          id: receiptId,
+          correlation_key: key,
+          card_id: cardId,
+          request_fingerprint: requestedFingerprint,
+          stored_fingerprint: requestedFingerprint,
+          outcome: "refused",
+          reason_code: "workboard_stored_record_invalid",
+          detail_code: "governance-spec-invalid",
+          created_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+        });
+        expect(lookup.receipt).not.toHaveProperty("request_id");
+        expect(lookup.receipt).not.toHaveProperty("retryable");
+        expect(rawDigest(fixture.dbPath, cardId)).toBe(invariantBefore);
+        expect(receiptCount(fixture.dbPath, key)).toBe(receiptsBefore + 1);
+        const corruptRowAfter = new DatabaseSync(fixture.dbPath);
+        const persistedAfter = corruptRowAfter
+          .prepare(
+            "SELECT governance_spec_json, governance_fingerprint FROM workboard_cards WHERE id = ?",
+          )
+          .get(cardId) as {
+          governance_spec_json: string;
+          governance_fingerprint: string;
+        };
+        corruptRowAfter.close();
+        expect(persistedAfter).toEqual(persistedBefore);
+        for (const spy of [...effectSpies, ...fallbackSpies]) {
+          expect(spy).not.toHaveBeenCalled();
+          spy.mockRestore();
+        }
+      } finally {
+        vi.restoreAllMocks();
+        fixture.close();
+      }
+    });
+  }
+});
+
+describe("AUT-WB-ATOMIC no execution surface (A37)", () => {
+  it("static: the atomic modules never import dispatcher or subagent surfaces", () => {
+    const here = path.dirname(new URL(import.meta.url).pathname);
+    for (const file of ["store.ts", "sqlite-store.ts"]) {
+      const source = fs.readFileSync(path.join(here, file), "utf8");
+      expect(source.includes("dispatcher")).toBe(false);
+      expect(source.includes("subagent")).toBe(false);
+      expect(source.includes("runtime.subagent")).toBe(false);
+    }
+  });
+
+  it("dynamic: throwing spies on every execution-adjacent method stay uncalled", async () => {
+    const fixture = openAtomicFixture();
+    const executionSurfaces = [
+      "claim",
+      "promote",
+      "reclaim",
+      "reassign",
+      "complete",
+      "block",
+      "unblock",
+      "dispatch",
+      "move",
+      "create",
+      "update",
+      "bulkUpdate",
+      "heartbeat",
+      "releaseClaim",
+    ] as const;
+    const spies = executionSurfaces.map((method) =>
+      vi
+        .spyOn(fixture.store as unknown as Record<string, (...args: never[]) => unknown>, method)
+        .mockImplementation(() => {
+          throw new Error(`execution surface reached: ${method}`);
+        }),
+    );
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(created.reason_code).toBe("workboard_card_created");
+      const recovered = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(recovered.reason_code).toBe("workboard_card_recovered");
+      const conflictSpec = makeAtomicSpec("aut-test.daily-brief", "2026-08-03T12:00:00.000Z", 1, {
+        automation: { skill_version: "2.0.0" },
+      });
+      const conflict = await fixture.store.createOrRecoverByCorrelationKey(key, conflictSpec.spec);
+      expect(conflict.reason_code).toBe("workboard_card_conflict");
+      for (const spy of spies) {
+        expect(spy).not.toHaveBeenCalled();
+      }
+    } finally {
+      for (const spy of spies) {
+        spy.mockRestore();
+      }
+      fixture.close();
+    }
+  });
+
+  it("buildAtomicEnvelope emits only frozen ok/outcome/retryable combinations", () => {
+    const table: Array<[string, boolean, string, boolean]> = [
+      ["workboard_card_created", true, "created", false],
+      ["workboard_card_recovered", true, "recovered", false],
+      ["workboard_card_conflict", false, "refused", false],
+      ["workboard_create_request_invalid", false, "refused", false],
+      ["workboard_stored_record_invalid", false, "refused", false],
+      ["workboard_card_state_incompatible", false, "refused", false],
+      ["workboard_unavailable", false, "failed", true],
+      ["workboard_storage_failure", false, "failed", true],
+      ["workboard_result_uncertain", false, "uncertain", true],
+      ["workboard_atomic_migration_required", false, "refused", false],
+      ["workboard_incompatible_legacy_card", false, "refused", false],
+      ["workboard_result_invalid", false, "failed", true],
+    ];
+    for (const [code, ok, outcome, retryable] of table) {
+      const envelope = buildAtomicEnvelope(code as never, null);
+      expect(envelope.ok).toBe(ok);
+      expect(envelope.outcome).toBe(outcome);
+      expect(envelope.retryable).toBe(retryable);
+      expect(Object.keys(envelope).toSorted()).toEqual([
+        "card",
+        "correlation_key",
+        "evidence",
+        "ok",
+        "outcome",
+        "reason_code",
+        "retryable",
+        "schema_version",
+        "stored_fingerprint",
+        "stored_spec",
+      ]);
+    }
+  });
+});
+
+describe("AUT-WB-ATOMIC canonical stored bytes (Round-1 defect 4)", () => {
+  // Rewrites the stored governance_spec_json to semantically equal but
+  // non-canonical bytes while leaving the (still fingerprint-consistent, since the
+  // fingerprint is computed over canonical bytes) stored fingerprint untouched.
+  const variants: Array<{ label: string; rewrite: (canonical: string) => string }> = [
+    {
+      label: "pretty-printed JSON",
+      rewrite: (canonical) => JSON.stringify(JSON.parse(canonical), null, 2),
+    },
+    {
+      label: "reordered keys",
+      rewrite: (canonical) => {
+        const reversedCanonical = (value: unknown): string => {
+          if (Array.isArray(value)) {
+            return `[${value.map((entry) => reversedCanonical(entry)).join(",")}]`;
+          }
+          if (value !== null && typeof value === "object") {
+            return `{${Object.keys(value as Record<string, unknown>)
+              .toSorted()
+              .toReversed()
+              .map(
+                (key) =>
+                  `${JSON.stringify(key)}:${reversedCanonical((value as Record<string, unknown>)[key])}`,
+              )
+              .join(",")}}`;
+          }
+          return JSON.stringify(value);
+        };
+        return reversedCanonical(JSON.parse(canonical));
+      },
+    },
+    {
+      label: "insignificant whitespace",
+      rewrite: (canonical) => `${canonical} `,
+    },
+  ];
+
+  for (const variant of variants) {
+    it(`${variant.label} with an unchanged stored fingerprint is stored-record invalid, not recovered`, async () => {
+      const fixture = openAtomicFixture();
+      try {
+        const { key, spec } = makeAtomicSpec();
+        const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(created.reason_code).toBe("workboard_card_created");
+        const cardId = created.card?.id as string;
+        corruptCorrelatedRow(fixture.dbPath, (db) => {
+          const row = db
+            .prepare(
+              "SELECT governance_spec_json, governance_fingerprint FROM workboard_cards WHERE id = ?",
+            )
+            .get(cardId) as { governance_spec_json: string; governance_fingerprint: string };
+          const rewritten = variant.rewrite(row.governance_spec_json);
+          expect(rewritten).not.toBe(row.governance_spec_json);
+          expect(JSON.parse(rewritten)).toEqual(JSON.parse(row.governance_spec_json));
+          db.prepare("UPDATE workboard_cards SET governance_spec_json = ? WHERE id = ?").run(
+            rewritten,
+            cardId,
+          );
+        });
+        const fingerprintAfter = new DatabaseSync(fixture.dbPath)
+          .prepare("SELECT governance_fingerprint AS fp FROM workboard_cards WHERE id = ?")
+          .get(cardId) as { fp: string };
+        expect(fingerprintAfter.fp).toBe(created.stored_fingerprint);
+        const before = rawDigest(fixture.dbPath, cardId);
+        const result = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+        expect(result.reason_code).toBe("workboard_stored_record_invalid");
+        expect(result.ok).toBe(false);
+        expect(result.card).toBeNull();
+        expect(result.stored_spec).toBeNull();
+        expect(result.evidence?.kind).toBe("workboard_atomic_receipt");
+        // Not normalized, rewritten, or recovered: bytes and full digest unchanged.
+        expect(rawDigest(fixture.dbPath, cardId)).toBe(before);
+        const db = new DatabaseSync(fixture.dbPath);
+        try {
+          const receipt = db
+            .prepare(
+              "SELECT detail_code FROM workboard_atomic_create_receipts WHERE reason_code = 'workboard_stored_record_invalid' ORDER BY created_at DESC LIMIT 1",
+            )
+            .get() as { detail_code: string };
+          expect(receipt.detail_code).toBe("governance-spec-noncanonical");
+        } finally {
+          db.close();
+        }
+      } finally {
+        fixture.close();
+      }
+    });
+  }
+
+  it("canonical stored bytes control: the untouched card still recovers", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const created = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      const recovered = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(recovered.reason_code).toBe("workboard_card_recovered");
+      expect(recovered.card?.id).toBe(created.card?.id);
+    } finally {
+      fixture.close();
+    }
+  });
+});
+
+describe("AUT-WB-ATOMIC closed receipt lookup validation (Round-1 defect 5)", () => {
+  type ReceiptRowFixture = {
+    id: string;
+    correlationKey: string;
+    cardId: string | null;
+    requestFingerprint: string;
+    storedFingerprint: string | null;
+    outcome: string;
+    reasonCode: string;
+    detailCode: string | null;
+    createdAt: number;
+  };
+  const VALID_ROW: ReceiptRowFixture = {
+    id: "99999999-9999-4999-8999-999999999999",
+    correlationKey: FROZEN_KEY,
+    cardId: "77777777-7777-4777-8777-777777777777",
+    requestFingerprint: FROZEN_FINGERPRINT,
+    storedFingerprint: FROZEN_FINGERPRINT,
+    outcome: "created",
+    reasonCode: "workboard_card_created",
+    detailCode: null,
+    createdAt: 5,
+  };
+
+  function storeWithReceiptRow(row: typeof VALID_ROW) {
+    // A minimal atomic-capable stub whose persisted receipt row is adversarial.
+    // This unit-tests the closed store-layer validation independently of the SQLite
+    // CHECK constraints (which are proven separately at the DDL boundary).
+    const capability = {
+      atomicCreateOrRecover: () => ({ kind: "uncertain" as const }),
+      getAtomicCreateReceipt: () => ({ ...row }),
+      isCorrelatedCard: () => false,
+      verifyAtomicMigrationComplete: () => true,
+    };
+    const memory = createMemoryStore();
+    return new WorkboardStore(Object.assign(memory, capability));
+  }
+
+  it("emits a valid persisted receipt as the closed envelope (control)", async () => {
+    const store = storeWithReceiptRow(VALID_ROW);
+    const lookup = await store.getAtomicCreateReceipt(VALID_ROW.id);
+    expect(lookup.receipt).toMatchObject({
+      schema_version: 1,
+      id: VALID_ROW.id,
+      correlation_key: FROZEN_KEY,
+      outcome: "created",
+      reason_code: "workboard_card_created",
+    });
+  });
+
+  it("rejects malformed persisted receipts instead of casting them", async () => {
+    const malformedRows: Array<Partial<typeof VALID_ROW>> = [
+      { correlationKey: FROZEN_KEY.toUpperCase() },
+      { correlationKey: "occ_v2_7a80f585e84b83e031d3eb8823faaee0" },
+      { requestFingerprint: `sha256:${"Z".repeat(64)}` },
+      { storedFingerprint: "sha1:abc" },
+      { cardId: null },
+      { cardId: "not-a-uuid" },
+      { detailCode: "Free form prose!" },
+      { detailCode: "not-in-the-closed-set" },
+      { outcome: "refused" },
+      { outcome: "created", reasonCode: "workboard_card_recovered" },
+      { reasonCode: "workboard_unavailable", outcome: "failed" },
+      { createdAt: 0 },
+      { createdAt: 1.5 },
+    ];
+    for (const overrides of malformedRows) {
+      const store = storeWithReceiptRow({ ...VALID_ROW, ...overrides });
+      await expect(
+        store.getAtomicCreateReceipt(VALID_ROW.id),
+        JSON.stringify(overrides),
+      ).rejects.toThrow(/receipt failed closed validation/);
+    }
+    // Nullable-combination rules are reason-scoped: a legacy refusal must not carry
+    // a stored fingerprint, and a state refusal must carry a detail code.
+    await expect(
+      storeWithReceiptRow({
+        ...VALID_ROW,
+        outcome: "refused",
+        reasonCode: "workboard_incompatible_legacy_card",
+        cardId: null,
+        storedFingerprint: FROZEN_FINGERPRINT,
+        detailCode: null,
+      }).getAtomicCreateReceipt(VALID_ROW.id),
+    ).rejects.toThrow(/receipt failed closed validation/);
+    await expect(
+      storeWithReceiptRow({
+        ...VALID_ROW,
+        outcome: "refused",
+        reasonCode: "workboard_card_state_incompatible",
+        detailCode: null,
+      }).getAtomicCreateReceipt(VALID_ROW.id),
+    ).rejects.toThrow(/receipt failed closed validation/);
+  });
+});
+
+describe("AUT-WB-ATOMIC escaped legacy key at the store boundary (Round-1 defect 2)", () => {
+  it("detects a JSON-escaped semantically equal legacy key and never creates beside it", async () => {
+    const fixture = openAtomicFixture();
+    try {
+      const { key, spec } = makeAtomicSpec();
+      const escapedChar = `\\u00${key.charCodeAt(12).toString(16).padStart(2, "0")}`;
+      const escapedPayload = `{"idempotencyKey":"${key.slice(0, 12)}${escapedChar}${key.slice(13)}"}`;
+      expect(escapedPayload.includes(key)).toBe(false);
+      expect((JSON.parse(escapedPayload) as { idempotencyKey: string }).idempotencyKey).toBe(key);
+      const db = new DatabaseSync(fixture.dbPath);
+      db.prepare(
+        `
+          INSERT INTO workboard_cards
+            (id, board_id, title, status, priority, position, created_at, updated_at, automation_json)
+          VALUES ('66666666-6666-4666-8666-666666666667', 'default', 'escaped legacy', 'backlog', 'normal', 1, 1, 1, ?)
+        `,
+      ).run(escapedPayload);
+      db.close();
+      const legacyDigestBefore = rawDigest(fixture.dbPath, "66666666-6666-4666-8666-666666666667");
+      const result = await fixture.store.createOrRecoverByCorrelationKey(key, spec);
+      expect(result.reason_code).toBe("workboard_incompatible_legacy_card");
+      expect(result.card).toBeNull();
+      expect(receiptCount(fixture.dbPath, key)).toBe(1);
+      // Zero adoption, zero mutation: the legacy advertiser is untouched and no
+      // correlated card exists.
+      expect(rawDigest(fixture.dbPath, "66666666-6666-4666-8666-666666666667")).toBe(
+        legacyDigestBefore,
+      );
+      const check = new DatabaseSync(fixture.dbPath);
+      const adopted = check
+        .prepare("SELECT COUNT(*) AS n FROM workboard_cards WHERE correlation_key IS NOT NULL")
+        .get() as { n: number | bigint };
+      check.close();
+      expect(Number(adopted.n)).toBe(0);
+    } finally {
+      fixture.close();
+    }
   });
 });

@@ -1,5 +1,5 @@
 // Workboard plugin module implements store behavior.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   isFutureDateTimestampMs,
   MAX_DATE_TIMESTAMP_MS,
@@ -13,8 +13,18 @@ import type {
   PersistedWorkboardNotificationSubscription,
   WorkboardKeyedStore,
 } from "./persistence-types.js";
-import { createWorkboardSqliteStores } from "./sqlite-store.js";
 import {
+  createWorkboardSqliteStores,
+  type WorkboardAtomicCapableCardStore,
+  type WorkboardAtomicJudgeVerdict,
+  type WorkboardAtomicReceiptRow,
+  type WorkboardAtomicStoredCardRow,
+} from "./sqlite-store.js";
+import {
+  WORKBOARD_ATOMIC_APPROVAL_POLICIES,
+  WORKBOARD_ATOMIC_LABELS,
+  WORKBOARD_ATOMIC_REASON_TABLE,
+  WORKBOARD_ATOMIC_RISK_CLASSES,
   WORKBOARD_DIAGNOSTIC_KINDS,
   WORKBOARD_DIAGNOSTIC_SEVERITIES,
   WORKBOARD_EXECUTION_ENGINES,
@@ -62,6 +72,12 @@ import {
   type WorkboardWorkerLog,
   type WorkboardWorkerProtocol,
   type WorkboardWorkspace,
+  type AtomicCreateReceiptLookupResponseV1,
+  type AtomicCreateReceiptV1,
+  type AtomicCreateResponseV1,
+  type CanonicalAutomationCardSpecV1,
+  type WorkboardAtomicCardProjectionV1,
+  type WorkboardAtomicReasonCode,
 } from "./types.js";
 export type {
   PersistedWorkboardAttachment,
@@ -2278,6 +2294,741 @@ function compareNotifications(a: WorkboardNotification, b: WorkboardNotification
   return a.id.localeCompare(b.id);
 }
 
+// --- AUT-WB-ATOMIC server boundary (contract aut-wb-atomic/1, child aut-wb-atomic-server/1) ---
+// Request validation, canonical serialization, fingerprinting, and stored-record
+// judgement for createOrRecoverByCorrelationKey. Every grammar, template, bound, and
+// precedence rule below is frozen by the contract; do not loosen or default.
+
+const ATOMIC_KEY_RE = /^occ_v1_[0-9a-f]{32}$/;
+const ATOMIC_BOARD_ID_RE = /^[a-z0-9][a-z0-9._-]{0,79}$/;
+const ATOMIC_LANE_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const ATOMIC_AUTOMATION_ID_RE = /^[a-z0-9][a-z0-9._-]{2,63}$/;
+const ATOMIC_SKILL_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const ATOMIC_SKILL_VERSION_RE = /^\d+\.\d+\.\d+$/;
+const ATOMIC_FINGERPRINT_RE = /^sha256:[0-9a-f]{64}$/;
+const ATOMIC_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const ATOMIC_PRINTABLE_ASCII_RE = /^[\x20-\x7E]*$/;
+const ATOMIC_REF_SCHEME_RE = /^[a-z][a-z0-9+.-]{1,15}$/;
+const ATOMIC_REF_SEGMENT_RE = /^[A-Za-z0-9._@#=+-]{1,64}$/;
+const ATOMIC_REF_SCHEMES = new Set([
+  "workboard",
+  "board",
+  "operator",
+  "vault",
+  "skill",
+  "contract",
+  "receipt",
+  "issue",
+  "doc",
+  "state",
+]);
+const ATOMIC_REF_PATH_ROOTS = new Set([
+  "contracts",
+  "reports",
+  "docs",
+  "agent_core",
+  "deployments",
+  "workspace",
+]);
+// AUT-001 secret posture: secret-named identifiers and real token shapes are refused
+// anywhere in the request. Patterns mirror the frozen AUT-001 rules verbatim.
+const ATOMIC_SECRET_NAME_RE =
+  /(secret|token|passwd|password|credential|api[_-]?key|apikey|private[_-]?key|client[_-]?secret|access[_-]?key|bearer)/i;
+const ATOMIC_SECRET_VALUE_PATTERNS = [
+  /\bgh[pousr]_[A-Za-z0-9]{16,}/,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}/,
+  /\bsk-[A-Za-z0-9_-]{20,}/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+];
+const ATOMIC_TITLE_MAX_BYTES = 200;
+const ATOMIC_NOTES_MAX_BYTES = 2048;
+const ATOMIC_REF_MAX_BYTES = 256;
+const ATOMIC_FINGERPRINT_DOMAIN = "veelo-workboard-card-spec|v1\n";
+const ATOMIC_KEY_MATERIAL_PREFIX = "veelo-aut-occ|v1|";
+const ATOMIC_EVIDENCE_REF_PREFIX = "workboard:atomic-create-receipt/";
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asciiBytes(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && keys.every((key) => actual.includes(key));
+}
+
+function atomicSecretShapedValue(value: string): boolean {
+  return ATOMIC_SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+// Deep scan: no string anywhere in the spec may carry token-shaped material or CR/LF.
+function atomicDeepSecretScan(value: unknown): boolean {
+  if (typeof value === "string") {
+    return !value.includes("\r") && !value.includes("\n") && !atomicSecretShapedValue(value);
+  }
+  if (Array.isArray(value)) {
+    return value.every((entry) => atomicDeepSecretScan(entry));
+  }
+  if (isPlainObject(value)) {
+    return Object.entries(value).every(
+      ([key, entry]) => !ATOMIC_SECRET_NAME_RE.test(key) && atomicDeepSecretScan(entry),
+    );
+  }
+  return true;
+}
+
+// Frozen AUT-001 closed reference grammar (scheme form or path form) plus the
+// role-specific namespace prefix required by the contract for each field.
+function validAtomicReference(value: unknown, requiredPrefix: string): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const bytes = asciiBytes(value);
+  if (bytes < 1 || bytes > ATOMIC_REF_MAX_BYTES) {
+    return false;
+  }
+  if (!ATOMIC_PRINTABLE_ASCII_RE.test(value) || atomicSecretShapedValue(value)) {
+    return false;
+  }
+  const colon = value.indexOf(":");
+  let segments: string[];
+  if (colon >= 0) {
+    const scheme = value.slice(0, colon);
+    if (!ATOMIC_REF_SCHEME_RE.test(scheme) || !ATOMIC_REF_SCHEMES.has(scheme)) {
+      return false;
+    }
+    if (ATOMIC_SECRET_NAME_RE.test(scheme)) {
+      return false;
+    }
+    segments = value.slice(colon + 1).split("/");
+    if (segments.length < 1) {
+      return false;
+    }
+  } else {
+    segments = value.split("/");
+    if (segments.length < 2) {
+      return false;
+    }
+    const root = segments[0];
+    if (!root || !ATOMIC_REF_PATH_ROOTS.has(root)) {
+      return false;
+    }
+  }
+  if (
+    !segments.every(
+      (segment) => ATOMIC_REF_SEGMENT_RE.test(segment) && !ATOMIC_SECRET_NAME_RE.test(segment),
+    )
+  ) {
+    return false;
+  }
+  if (!value.startsWith(requiredPrefix) || value.length <= requiredPrefix.length) {
+    return false;
+  }
+  return true;
+}
+
+function canonicalUtcInstant(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+export function isAtomicCorrelationKey(value: unknown): value is string {
+  return typeof value === "string" && ATOMIC_KEY_RE.test(value);
+}
+
+export function deriveAtomicOccurrenceKey(
+  automationId: string,
+  scheduleRevision: number,
+  scheduledAt: string,
+): string {
+  const material = `${ATOMIC_KEY_MATERIAL_PREFIX}${automationId}|rev${scheduleRevision}|${scheduledAt}`;
+  return `occ_v1_${createHash("sha256").update(material, "utf8").digest("hex").slice(0, 32)}`;
+}
+
+export function atomicCardTitle(automationId: string, scheduledAt: string): string {
+  return `Automation ${automationId} @ ${scheduledAt}`;
+}
+
+export function atomicCardNotes(automation: CanonicalAutomationCardSpecV1["automation"]): string {
+  return (
+    `Governed automation occurrence; occurrence_key=${automation.occurrence_key}; ` +
+    `automation_id=${automation.automation_id}; ` +
+    `schedule_revision=${automation.schedule_revision}; ` +
+    `scheduled_at=${automation.scheduled_at}; ` +
+    `skill=${automation.skill_name}@${automation.skill_version}; ` +
+    `risk_class=${automation.risk_class}; ` +
+    `approval_policy=${automation.approval_policy}; ` +
+    `output_contract_ref=${automation.output_contract_ref}; ` +
+    `verification_contract_ref=${automation.verification_contract_ref}; ` +
+    `held=true; operator_controlled=true; execution_authorized=false.`
+  );
+}
+
+// Frozen canonical JSON: keys sorted ascending by UTF-16 code units at every depth,
+// arrays in validated order, JSON.stringify escaping, no insignificant whitespace.
+export function canonicalAtomicJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalAtomicJson(entry)).join(",")}]`;
+  }
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value)
+      .toSorted()
+      .map((key) => `${JSON.stringify(key)}:${canonicalAtomicJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function atomicSpecFingerprint(canonicalJson: string): string {
+  return `sha256:${createHash("sha256")
+    .update(`${ATOMIC_FINGERPRINT_DOMAIN}${canonicalJson}`, "utf8")
+    .digest("hex")}`;
+}
+
+type AtomicValidatedRequest = {
+  ok: true;
+  spec: CanonicalAutomationCardSpecV1;
+  canonicalJson: string;
+  fingerprint: string;
+};
+
+type AtomicInvalidRequest = {
+  ok: false;
+  correlationKey: string | null;
+};
+
+// Contract §3.5 precedence: the complete request is validated (including fixed and
+// derived fields, cross-field policy, namespaces, and key derivation) before any
+// lookup or transaction. Unknown, missing, malformed, or inconsistent input fails
+// closed with no defaults, coercion, trimming, or aliases.
+export function validateAtomicCreateRequest(
+  correlationKey: unknown,
+  cardSpec: unknown,
+): AtomicValidatedRequest | AtomicInvalidRequest {
+  const keyValid = typeof correlationKey === "string" && ATOMIC_KEY_RE.test(correlationKey);
+  const invalid: AtomicInvalidRequest = {
+    ok: false,
+    correlationKey: keyValid ? correlationKey : null,
+  };
+  if (!keyValid || !isPlainObject(cardSpec)) {
+    return invalid;
+  }
+  if (
+    !hasExactKeys(cardSpec, [
+      "schema_version",
+      "board",
+      "title",
+      "initial_status",
+      "priority",
+      "labels",
+      "notes",
+      "automation",
+      "execution_control",
+    ])
+  ) {
+    return invalid;
+  }
+  if (cardSpec.schema_version !== 1) {
+    return invalid;
+  }
+  const board = cardSpec.board;
+  if (!isPlainObject(board) || !hasExactKeys(board, ["id", "ref", "lane", "template_ref"])) {
+    return invalid;
+  }
+  if (typeof board.id !== "string" || !ATOMIC_BOARD_ID_RE.test(board.id)) {
+    return invalid;
+  }
+  if (board.ref !== `board:${board.id}`) {
+    return invalid;
+  }
+  if (board.lane !== null && (typeof board.lane !== "string" || !ATOMIC_LANE_RE.test(board.lane))) {
+    return invalid;
+  }
+  if (
+    board.template_ref !== null &&
+    !validAtomicReference(board.template_ref, "workboard:template/")
+  ) {
+    return invalid;
+  }
+  const automation = cardSpec.automation;
+  if (
+    !isPlainObject(automation) ||
+    !hasExactKeys(automation, [
+      "occurrence_key",
+      "automation_id",
+      "schedule_revision",
+      "scheduled_at",
+      "skill_name",
+      "skill_version",
+      "risk_class",
+      "approval_policy",
+      "output_contract_ref",
+      "verification_contract_ref",
+    ])
+  ) {
+    return invalid;
+  }
+  if (
+    typeof automation.automation_id !== "string" ||
+    !ATOMIC_AUTOMATION_ID_RE.test(automation.automation_id)
+  ) {
+    return invalid;
+  }
+  if (
+    typeof automation.schedule_revision !== "number" ||
+    !Number.isSafeInteger(automation.schedule_revision) ||
+    automation.schedule_revision < 1
+  ) {
+    return invalid;
+  }
+  if (!canonicalUtcInstant(automation.scheduled_at)) {
+    return invalid;
+  }
+  if (
+    typeof automation.skill_name !== "string" ||
+    !ATOMIC_SKILL_NAME_RE.test(automation.skill_name)
+  ) {
+    return invalid;
+  }
+  if (
+    typeof automation.skill_version !== "string" ||
+    asciiBytes(automation.skill_version) > 64 ||
+    !ATOMIC_SKILL_VERSION_RE.test(automation.skill_version)
+  ) {
+    return invalid;
+  }
+  if (
+    typeof automation.risk_class !== "string" ||
+    !(WORKBOARD_ATOMIC_RISK_CLASSES as readonly string[]).includes(automation.risk_class)
+  ) {
+    return invalid;
+  }
+  if (
+    typeof automation.approval_policy !== "string" ||
+    !(WORKBOARD_ATOMIC_APPROVAL_POLICIES as readonly string[]).includes(automation.approval_policy)
+  ) {
+    return invalid;
+  }
+  // AUT-001 risk/approval matrix: automatic approval is valid only for the
+  // read-only and draft-only risk classes.
+  if (
+    automation.approval_policy === "auto-within-risk-class" &&
+    automation.risk_class !== "read-only" &&
+    automation.risk_class !== "draft-only"
+  ) {
+    return invalid;
+  }
+  if (!validAtomicReference(automation.output_contract_ref, "contracts/output/")) {
+    return invalid;
+  }
+  if (!validAtomicReference(automation.verification_contract_ref, "contracts/verify/")) {
+    return invalid;
+  }
+  // Correlation identity is recomputed, never trusted: correlationKey, the spec's
+  // occurrence_key, and the derived key must be byte identical (contract §3.3).
+  const derivedKey = deriveAtomicOccurrenceKey(
+    automation.automation_id,
+    automation.schedule_revision,
+    automation.scheduled_at as string,
+  );
+  if (automation.occurrence_key !== correlationKey || derivedKey !== correlationKey) {
+    return invalid;
+  }
+  const expectedTitle = atomicCardTitle(
+    automation.automation_id,
+    automation.scheduled_at as string,
+  );
+  if (
+    cardSpec.title !== expectedTitle ||
+    !ATOMIC_PRINTABLE_ASCII_RE.test(expectedTitle) ||
+    asciiBytes(expectedTitle) < 1 ||
+    asciiBytes(expectedTitle) > ATOMIC_TITLE_MAX_BYTES
+  ) {
+    return invalid;
+  }
+  if (cardSpec.initial_status !== "backlog" || cardSpec.priority !== "normal") {
+    return invalid;
+  }
+  const labels = cardSpec.labels;
+  if (
+    !Array.isArray(labels) ||
+    labels.length !== WORKBOARD_ATOMIC_LABELS.length ||
+    !WORKBOARD_ATOMIC_LABELS.every((label, index) => labels[index] === label)
+  ) {
+    return invalid;
+  }
+  const spec = cardSpec as unknown as CanonicalAutomationCardSpecV1;
+  const expectedNotes = atomicCardNotes(spec.automation);
+  if (
+    cardSpec.notes !== expectedNotes ||
+    !ATOMIC_PRINTABLE_ASCII_RE.test(expectedNotes) ||
+    asciiBytes(expectedNotes) > ATOMIC_NOTES_MAX_BYTES
+  ) {
+    return invalid;
+  }
+  const executionControl = cardSpec.execution_control;
+  if (
+    !isPlainObject(executionControl) ||
+    !hasExactKeys(executionControl, [
+      "assignee_id",
+      "claim_owner_id",
+      "execution_id",
+      "execution_authorized",
+    ]) ||
+    executionControl.assignee_id !== null ||
+    executionControl.claim_owner_id !== null ||
+    executionControl.execution_id !== null ||
+    executionControl.execution_authorized !== false
+  ) {
+    return invalid;
+  }
+  if (!atomicDeepSecretScan(cardSpec)) {
+    return invalid;
+  }
+  const canonicalJson = canonicalAtomicJson(spec);
+  return { ok: true, spec, canonicalJson, fingerprint: atomicSpecFingerprint(canonicalJson) };
+}
+
+// Judges an indexed stored row inside the SQLite transaction (contract §2.3 steps
+// 4-6). Precedence: stored-record validity, then exact pristine held state, then
+// fingerprint compare. No branch mutates the card.
+export function judgeAtomicStoredRow(
+  row: WorkboardAtomicStoredCardRow,
+  request: AtomicValidatedRequest,
+  correlationKey: string,
+): WorkboardAtomicJudgeVerdict & { storedSpec: CanonicalAutomationCardSpecV1 | null } {
+  const storedFingerprint =
+    typeof row.governanceFingerprint === "string" &&
+    ATOMIC_FINGERPRINT_RE.test(row.governanceFingerprint)
+      ? row.governanceFingerprint
+      : null;
+  const storedInvalid = (detailCode: string) =>
+    ({
+      decision: "stored_record_invalid",
+      detailCode,
+      storedFingerprint,
+      storedSpec: null,
+    }) as const;
+  if (row.governanceSpecVersion !== 1) {
+    return storedInvalid("governance-spec-version-invalid");
+  }
+  if (storedFingerprint === null) {
+    return storedInvalid("governance-fingerprint-unreadable");
+  }
+  if (typeof row.governanceSpecJson !== "string") {
+    return storedInvalid("governance-spec-missing");
+  }
+  let parsedSpec: unknown;
+  try {
+    parsedSpec = JSON.parse(row.governanceSpecJson);
+  } catch {
+    return storedInvalid("governance-spec-unreadable");
+  }
+  const revalidated = validateAtomicCreateRequest(row.correlationKey, parsedSpec);
+  if (!revalidated.ok) {
+    return storedInvalid("governance-spec-invalid");
+  }
+  if (row.correlationKey !== correlationKey) {
+    return storedInvalid("correlation-key-mismatch");
+  }
+  if (revalidated.fingerprint !== storedFingerprint) {
+    return storedInvalid("governance-fingerprint-forged");
+  }
+  // The stored authority is the frozen canonical byte string, not merely a
+  // semantically equivalent JSON document: non-canonical persisted bytes are
+  // stored-record invalidity and are never normalized, rewritten, or recovered.
+  if (row.governanceSpecJson !== revalidated.canonicalJson) {
+    return storedInvalid("governance-spec-noncanonical");
+  }
+  const storedSpec = revalidated.spec;
+  const state = (detailCode: string) =>
+    ({
+      decision: "state_incompatible",
+      detailCode,
+      storedFingerprint,
+      storedSpec,
+    }) as const;
+  // Exact pristine held state (contract §5 closing paragraph), plus row-vs-spec
+  // canonical governance coherence: operator edits never rewrite proof, so drifted
+  // ordinary fields refuse rather than recover.
+  if (row.archivedAt !== null) {
+    return state("card-archived");
+  }
+  if (row.status !== "backlog") {
+    return state("status-not-backlog");
+  }
+  if (row.priority !== "normal") {
+    return state("priority-drift");
+  }
+  if (row.agentId !== null) {
+    return state("card-assigned");
+  }
+  if (row.claimJson !== null) {
+    return state("card-claimed");
+  }
+  if (row.executionId !== null) {
+    return state("card-executing");
+  }
+  // Every persisted execution field must be null before recovery (parent invariant
+  // 13 and the §5 pristine-state definition) - each is checked independently.
+  if (row.executionKind !== null) {
+    return state("execution-kind-set");
+  }
+  if (row.executionEngine !== null) {
+    return state("execution-engine-set");
+  }
+  if (row.executionMode !== null) {
+    return state("execution-mode-set");
+  }
+  if (row.executionStatus !== null) {
+    return state("execution-status-set");
+  }
+  if (row.executionModel !== null) {
+    return state("execution-model-set");
+  }
+  if (row.executionSessionKey !== null) {
+    return state("execution-session-key-set");
+  }
+  if (row.executionRunId !== null) {
+    return state("execution-run-id-set");
+  }
+  if (row.executionStartedAt !== null) {
+    return state("execution-started-at-set");
+  }
+  if (row.executionUpdatedAt !== null) {
+    return state("execution-updated-at-set");
+  }
+  if (row.startedAt !== null) {
+    return state("card-started");
+  }
+  if (row.completedAt !== null) {
+    return state("card-completed");
+  }
+  if (row.attemptCount !== 0) {
+    return state("card-has-attempts");
+  }
+  if (
+    row.labels.length !== WORKBOARD_ATOMIC_LABELS.length ||
+    !WORKBOARD_ATOMIC_LABELS.every((label, index) => row.labels[index] === label)
+  ) {
+    return state("labels-drift");
+  }
+  if (row.title !== storedSpec.title) {
+    return state("title-drift");
+  }
+  if (row.notes !== storedSpec.notes) {
+    return state("notes-drift");
+  }
+  if (row.boardId !== storedSpec.board.id) {
+    return state("board-drift");
+  }
+  if (request.fingerprint !== storedFingerprint) {
+    return { decision: "conflict", detailCode: null, storedFingerprint, storedSpec };
+  }
+  return { decision: "recovered", detailCode: null, storedFingerprint, storedSpec };
+}
+
+function atomicCardProjection(
+  cardId: string,
+  boardId: string,
+  spec: CanonicalAutomationCardSpecV1,
+): WorkboardAtomicCardProjectionV1 {
+  return {
+    id: cardId,
+    board_id: boardId,
+    title: spec.title,
+    status: "backlog",
+    priority: "normal",
+    labels: [...WORKBOARD_ATOMIC_LABELS] as CanonicalAutomationCardSpecV1["labels"],
+    notes: spec.notes,
+    agent_id: null,
+    claim: null,
+    execution: null,
+    started_at: null,
+    completed_at: null,
+    archived_at: null,
+  };
+}
+
+type AtomicEnvelopeExtras = {
+  card?: WorkboardAtomicCardProjectionV1 | null;
+  stored_spec?: CanonicalAutomationCardSpecV1 | null;
+  stored_fingerprint?: string | null;
+  evidenceReceiptId?: string | null;
+};
+
+export function buildAtomicEnvelope(
+  reasonCode: WorkboardAtomicReasonCode,
+  correlationKey: string | null,
+  extras: AtomicEnvelopeExtras = {},
+): AtomicCreateResponseV1 {
+  const row = WORKBOARD_ATOMIC_REASON_TABLE[reasonCode];
+  return {
+    schema_version: 1,
+    ok: row.ok,
+    outcome: row.outcome,
+    reason_code: reasonCode,
+    retryable: row.retryable,
+    correlation_key: correlationKey,
+    card: extras.card ?? null,
+    stored_spec: extras.stored_spec ?? null,
+    stored_fingerprint: extras.stored_fingerprint ?? null,
+    evidence: extras.evidenceReceiptId
+      ? {
+          kind: "workboard_atomic_receipt",
+          ref: `${ATOMIC_EVIDENCE_REF_PREFIX}${extras.evidenceReceiptId}`,
+        }
+      : null,
+  };
+}
+
+// Closed detail-code universe the server ever writes. Lookup refuses anything else:
+// receipts are an authority surface, not a cast-through.
+const ATOMIC_RECEIPT_DETAIL_CODES = new Set([
+  "governance-spec-version-invalid",
+  "governance-fingerprint-unreadable",
+  "governance-spec-missing",
+  "governance-spec-unreadable",
+  "governance-spec-invalid",
+  "governance-spec-noncanonical",
+  "correlation-key-mismatch",
+  "governance-fingerprint-forged",
+  "card-archived",
+  "status-not-backlog",
+  "priority-drift",
+  "card-assigned",
+  "card-claimed",
+  "card-executing",
+  "execution-kind-set",
+  "execution-engine-set",
+  "execution-mode-set",
+  "execution-status-set",
+  "execution-model-set",
+  "execution-session-key-set",
+  "execution-run-id-set",
+  "execution-started-at-set",
+  "execution-updated-at-set",
+  "card-started",
+  "card-completed",
+  "card-has-attempts",
+  "labels-drift",
+  "title-drift",
+  "notes-drift",
+  "board-drift",
+  "legacy-metadata-malformed",
+  "indexed-legacy-mismatch",
+]);
+const ATOMIC_LEGACY_CANDIDATES_DETAIL_RE = /^legacy-candidates-[1-9][0-9]{0,9}$/;
+
+// The six receipt-durable reason codes with their frozen outcome (contract §4.3).
+const ATOMIC_RECEIPT_REASON_OUTCOMES: Record<string, string> = {
+  workboard_card_created: "created",
+  workboard_card_recovered: "recovered",
+  workboard_card_conflict: "refused",
+  workboard_stored_record_invalid: "refused",
+  workboard_card_state_incompatible: "refused",
+  workboard_incompatible_legacy_card: "refused",
+};
+
+// Closed validation of a persisted receipt row before it may leave the boundary as
+// AtomicCreateReceiptV1. A malformed persisted receipt is rejected, never cast.
+function atomicReceiptProjection(row: WorkboardAtomicReceiptRow): AtomicCreateReceiptV1 {
+  const refuse = (field: string): never => {
+    throw new Error(`workboard atomic receipt failed closed validation: ${field}`);
+  };
+  if (!ATOMIC_UUID_RE.test(row.id)) {
+    refuse("id");
+  }
+  if (!ATOMIC_KEY_RE.test(row.correlationKey)) {
+    refuse("correlation_key");
+  }
+  if (!ATOMIC_FINGERPRINT_RE.test(row.requestFingerprint)) {
+    refuse("request_fingerprint");
+  }
+  if (row.storedFingerprint !== null && !ATOMIC_FINGERPRINT_RE.test(row.storedFingerprint)) {
+    refuse("stored_fingerprint");
+  }
+  if (row.cardId !== null && !ATOMIC_UUID_RE.test(row.cardId)) {
+    refuse("card_id");
+  }
+  const expectedOutcome = ATOMIC_RECEIPT_REASON_OUTCOMES[row.reasonCode];
+  if (expectedOutcome === undefined || row.outcome !== expectedOutcome) {
+    refuse("reason_code/outcome");
+  }
+  const reason = row.reasonCode;
+  const cardIdRequired =
+    reason === "workboard_card_created" ||
+    reason === "workboard_card_recovered" ||
+    reason === "workboard_card_conflict" ||
+    reason === "workboard_card_state_incompatible";
+  if (cardIdRequired && row.cardId === null) {
+    refuse("card_id-null");
+  }
+  if (cardIdRequired && row.storedFingerprint === null) {
+    refuse("stored_fingerprint-null");
+  }
+  if (reason === "workboard_incompatible_legacy_card" && row.storedFingerprint !== null) {
+    refuse("stored_fingerprint-forbidden");
+  }
+  const detailForbidden =
+    reason === "workboard_card_created" ||
+    reason === "workboard_card_recovered" ||
+    reason === "workboard_card_conflict";
+  if (detailForbidden && row.detailCode !== null) {
+    refuse("detail_code-forbidden");
+  }
+  const detailRequired =
+    reason === "workboard_card_state_incompatible" || reason === "workboard_stored_record_invalid";
+  if (detailRequired && row.detailCode === null) {
+    refuse("detail_code-null");
+  }
+  if (
+    row.detailCode !== null &&
+    !ATOMIC_RECEIPT_DETAIL_CODES.has(row.detailCode) &&
+    !ATOMIC_LEGACY_CANDIDATES_DETAIL_RE.test(row.detailCode)
+  ) {
+    refuse("detail_code");
+  }
+  if (!Number.isSafeInteger(row.createdAt) || row.createdAt <= 0) {
+    refuse("created_at");
+  }
+  return {
+    schema_version: 1,
+    id: row.id,
+    correlation_key: row.correlationKey,
+    card_id: row.cardId,
+    request_fingerprint: row.requestFingerprint,
+    stored_fingerprint: row.storedFingerprint,
+    outcome: row.outcome as AtomicCreateReceiptV1["outcome"],
+    reason_code: row.reasonCode as AtomicCreateReceiptV1["reason_code"],
+    detail_code: row.detailCode,
+    created_at: new Date(row.createdAt).toISOString(),
+  };
+}
+
+function resolveAtomicCapability(
+  store: WorkboardKeyedStore,
+): WorkboardAtomicCapableCardStore | null {
+  const candidate = store as Partial<WorkboardAtomicCapableCardStore>;
+  if (
+    typeof candidate.atomicCreateOrRecover === "function" &&
+    typeof candidate.getAtomicCreateReceipt === "function" &&
+    typeof candidate.isCorrelatedCard === "function" &&
+    typeof candidate.verifyAtomicMigrationComplete === "function"
+  ) {
+    return candidate as WorkboardAtomicCapableCardStore;
+  }
+  return null;
+}
+
 export class WorkboardStore {
   private mutationQueue: Promise<unknown> = Promise.resolve();
   private lastNotificationSequence = 0;
@@ -2853,12 +3604,140 @@ export class WorkboardStore {
     });
   }
 
-  async delete(id: string): Promise<{ deleted: boolean }> {
+  // AUT-WB-ATOMIC public boundary. Deliberately not routed through enqueueMutation:
+  // atomicity is owned by the SQLite transaction and unique correlation index, never
+  // by process-local serialization (contract invariant 4).
+  async createOrRecoverByCorrelationKey(
+    correlationKey: unknown,
+    cardSpec: unknown,
+  ): Promise<AtomicCreateResponseV1> {
+    const validated = validateAtomicCreateRequest(correlationKey, cardSpec);
+    if (!validated.ok) {
+      return buildAtomicEnvelope("workboard_create_request_invalid", validated.correlationKey);
+    }
+    const key = correlationKey as string;
+    const atomic = resolveAtomicCapability(this.store);
+    if (!atomic) {
+      return buildAtomicEnvelope("workboard_unavailable", key);
+    }
+    const cardId = randomUUID();
+    const receiptId = randomUUID();
+    let judged: ReturnType<typeof judgeAtomicStoredRow> | null = null;
+    let result: ReturnType<WorkboardAtomicCapableCardStore["atomicCreateOrRecover"]>;
+    try {
+      result = atomic.atomicCreateOrRecover(
+        {
+          correlationKey: key,
+          requestFingerprint: validated.fingerprint,
+          receiptId,
+          now: Date.now(),
+          newCard: {
+            cardId,
+            createdEventId: randomUUID(),
+            boardId: validated.spec.board.id,
+            title: validated.spec.title,
+            notes: validated.spec.notes,
+            labels: WORKBOARD_ATOMIC_LABELS,
+            governanceSpecJson: validated.canonicalJson,
+            governanceFingerprint: validated.fingerprint,
+          },
+        },
+        (row) => {
+          judged = judgeAtomicStoredRow(row, validated, key);
+          return judged;
+        },
+      );
+    } catch {
+      return buildAtomicEnvelope("workboard_result_uncertain", key);
+    }
+    switch (result.kind) {
+      case "migration_required":
+        return buildAtomicEnvelope("workboard_atomic_migration_required", key);
+      case "unavailable":
+        return buildAtomicEnvelope("workboard_unavailable", key);
+      case "storage_failure":
+        return buildAtomicEnvelope("workboard_storage_failure", key);
+      case "uncertain":
+        return buildAtomicEnvelope("workboard_result_uncertain", key);
+      case "created":
+        return buildAtomicEnvelope("workboard_card_created", key, {
+          card: atomicCardProjection(cardId, validated.spec.board.id, validated.spec),
+          stored_spec: validated.spec,
+          stored_fingerprint: validated.fingerprint,
+          evidenceReceiptId: result.receiptId,
+        });
+      case "refused_no_row":
+        return buildAtomicEnvelope(result.reasonCode, key, {
+          evidenceReceiptId: result.receiptId,
+        });
+      case "existing": {
+        const verdict = judged as ReturnType<typeof judgeAtomicStoredRow> | null;
+        if (!verdict) {
+          return buildAtomicEnvelope("workboard_result_uncertain", key);
+        }
+        switch (verdict.decision) {
+          case "recovered":
+            return buildAtomicEnvelope("workboard_card_recovered", key, {
+              card: verdict.storedSpec
+                ? atomicCardProjection(result.row.cardId, result.row.boardId, verdict.storedSpec)
+                : null,
+              stored_spec: verdict.storedSpec,
+              stored_fingerprint: verdict.storedFingerprint,
+              evidenceReceiptId: result.receiptId,
+            });
+          case "conflict":
+            return buildAtomicEnvelope("workboard_card_conflict", key, {
+              stored_fingerprint: verdict.storedFingerprint,
+              evidenceReceiptId: result.receiptId,
+            });
+          case "stored_record_invalid":
+            return buildAtomicEnvelope("workboard_stored_record_invalid", key, {
+              evidenceReceiptId: result.receiptId,
+            });
+          case "state_incompatible":
+            return buildAtomicEnvelope("workboard_card_state_incompatible", key, {
+              evidenceReceiptId: result.receiptId,
+            });
+        }
+      }
+    }
+    return buildAtomicEnvelope("workboard_result_uncertain", key);
+  }
+
+  // Read-only receipt lookup (contract §4.3). A malformed or unknown id resolves to
+  // a null receipt; the method can never list or mutate receipts.
+  async getAtomicCreateReceipt(id: unknown): Promise<AtomicCreateReceiptLookupResponseV1> {
+    const atomic = resolveAtomicCapability(this.store);
+    if (!atomic || typeof id !== "string" || !ATOMIC_UUID_RE.test(id)) {
+      return { schema_version: 1, receipt: null };
+    }
+    const row = atomic.getAtomicCreateReceipt(id);
+    return { schema_version: 1, receipt: row ? atomicReceiptProjection(row) : null };
+  }
+
+  supportsAtomicCreate(): boolean {
+    const atomic = resolveAtomicCapability(this.store);
+    return atomic !== null && atomic.verifyAtomicMigrationComplete();
+  }
+
+  async delete(id: string): Promise<{ deleted: boolean; archived?: boolean }> {
     return await this.enqueueMutation(async () => await this.deleteDirect(id));
   }
 
-  private async deleteDirect(id: string): Promise<{ deleted: boolean }> {
+  private async deleteDirect(id: string): Promise<{ deleted: boolean; archived?: boolean }> {
     const cardId = id.trim();
+    // Correlated cards are never physically deleted: normal delete archives and the
+    // row/key remain reserved for the card's lifetime (contract §6.4).
+    const atomic = resolveAtomicCapability(this.store);
+    if (atomic?.isCorrelatedCard(cardId)) {
+      const existing = await this.get(cardId);
+      if (existing) {
+        await this.updateCard(cardId, {
+          metadata: { ...existing.metadata, archivedAt: Date.now() },
+        });
+      }
+      return { deleted: false, archived: true };
+    }
     const deleted = await this.store.delete(cardId);
     if (!deleted) {
       return { deleted: false };

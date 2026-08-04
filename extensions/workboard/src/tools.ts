@@ -171,6 +171,98 @@ const CardIdSchema = Type.Object(
   { additionalProperties: false },
 );
 
+/**
+ * Completion evidence gate for `workboard_complete`.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Three surfaces can move a card to `done`, and until now only two of them
+ * asked for evidence:
+ *
+ *   - a closer that completes cards from worker-run output — gated, and it
+ *     always attaches a provenance proof object;
+ *   - the `openclaw workboard complete` CLI — gated by an operator shim that
+ *     refuses a completion carrying no checkable reference;
+ *   - THIS TOOL — ungated. `proof` was optional and `execute` called
+ *     `store.complete` directly, so a worker could finish a card with a
+ *     `summary` string and nothing else.
+ *
+ * The dispatcher prompt tells every worker to call `workboard_complete`, so the
+ * ungated path was also the recommended one. Between 2026-07-21 and 2026-08-04,
+ * 31 cards reached `done` through it with zero proof entries. The work was
+ * generally real — the workers wrote test counts, commit SHAs and PR links into
+ * free-text comments — but none of it landed anywhere a later reader could
+ * check, so "done" on the board stopped meaning anything verifiable.
+ *
+ * THE RULE
+ * --------
+ * A completion must carry something someone else could actually re-run or open:
+ * a non-empty `proof.command` or `proof.url`. Prose does not qualify, no matter
+ * how detailed — `summary` and `proof.note` are narrative.
+ *
+ * `noProofReason` is the escape hatch and always succeeds. Some cards genuinely
+ * have no artifact (a discussion, a read-only investigation); those complete
+ * with the reason recorded as an `unknown`-status proof entry so the absence is
+ * itself auditable. A refused completion is never a dead end, which matters:
+ * a gate a worker cannot get past becomes a stuck card.
+ *
+ * Modes via `OPENCLAW_WORKBOARD_REQUIRE_PROOF`: `enforce` (default, refuse),
+ * `warn` (allow, and record the same unknown-status entry so the would-be
+ * refusals are visible), `off` (legacy).
+ *
+ * Only completion is gated. `workboard_block` must always be reportable and
+ * `workboard_heartbeat` must never be blocked by policy.
+ */
+type ProofLike = {
+  status?: string;
+  label?: string;
+  command?: string;
+  url?: string;
+  note?: string;
+};
+
+const hasText = (value: unknown): boolean => typeof value === "string" && value.trim() !== "";
+
+function requireProofMode(env: NodeJS.ProcessEnv = process.env): "enforce" | "warn" | "off" {
+  const raw = String(env.OPENCLAW_WORKBOARD_REQUIRE_PROOF ?? "enforce").toLowerCase();
+  return raw === "off" || raw === "warn" ? raw : "enforce";
+}
+
+/**
+ * `proofId` is deliberately NOT a pass condition of its own. The store already
+ * requires a `proof` object whenever `proofId` is supplied ("proof is required
+ * when proofId is provided"), and that object is what actually gets recorded —
+ * so judging the proof covers the two-step `workboard_proof` path too, and a
+ * resolution carrying nothing checkable is exactly the case worth catching.
+ */
+function hasVerifiableEvidence(params: { proof?: ProofLike }): boolean {
+  const proof = params.proof;
+  return Boolean(proof) && (hasText(proof?.command) || hasText(proof?.url));
+}
+
+const NO_PROOF_LABEL = "completed without verifiable evidence";
+
+/** The proof entry recorded when a completion legitimately has no artifact. */
+function noProofEntry(reason: string): ProofLike {
+  return {
+    status: "unknown",
+    label: NO_PROOF_LABEL,
+    note: reason.trim(),
+  };
+}
+
+function evidenceRefusal(id: string): Error {
+  const short = id.slice(0, 8);
+  return new Error(
+    `refusing to complete card ${id} — no verifiable evidence. ` +
+      "A summary, or a proof note, is prose and does not prove a card. Re-run with ONE of:\n" +
+      `  proof: { command: "<the exact command you ran> # card ${short}" }\n` +
+      '  proof: { url: "<PR or CI url>" }\n' +
+      '  noProofReason: "<why there is no command or url for this card>"\n' +
+      "The last form completes the card and records the reason for audit.",
+  );
+}
+
 export function createWorkboardTools(params: {
   api: OpenClawPluginApi;
   context?: OpenClawPluginToolContext;
@@ -476,16 +568,26 @@ export function createWorkboardTools(params: {
       name: "workboard_complete",
       label: "Workboard Complete",
       description:
-        "Complete a claimed Workboard card with a structured summary, proof, artifacts, and created-card manifest.",
+        "Complete a claimed Workboard card. Requires evidence someone else could check: " +
+        "proof.command (the exact command you ran) or proof.url (a PR or CI link). " +
+        "A summary alone will NOT complete the card — it is narrative, not proof. " +
+        "If this card genuinely has no artifact (a discussion, a read-only investigation), " +
+        "pass noProofReason instead and the card completes with that reason recorded.",
       parameters: Type.Object(
         {
           id: cardIdField(),
           token: claimTokenField(),
-          summary: Type.Optional(Type.String({ description: "Completion summary." })),
+          summary: Type.Optional(
+            Type.String({
+              description:
+                "Completion summary. Narrative only — this does not satisfy the evidence requirement.",
+            }),
+          ),
           proofId: Type.Optional(
             Type.String({
               description:
-                "Proof id returned by workboard_proof when resolving that pending proof.",
+                "Proof id returned by workboard_proof when resolving that pending proof. " +
+                "Requires an accompanying proof object, which must itself carry a command or url.",
             }),
           ),
           proof: Type.Optional(
@@ -495,12 +597,34 @@ export function createWorkboardTools(params: {
                   Type.String({ description: "passed, failed, skipped, or unknown." }),
                 ),
                 label: Type.Optional(Type.String({ description: "Proof label." })),
-                command: Type.Optional(Type.String({ description: "Command or step run." })),
-                url: Type.Optional(Type.String({ description: "Proof URL." })),
-                note: Type.Optional(Type.String({ description: "Proof note." })),
+                command: Type.Optional(
+                  Type.String({
+                    description:
+                      "The exact command you ran, so someone else can re-run it. Satisfies the evidence requirement.",
+                  }),
+                ),
+                url: Type.Optional(
+                  Type.String({
+                    description:
+                      "A PR, CI, or artifact URL someone else can open. Satisfies the evidence requirement.",
+                  }),
+                ),
+                note: Type.Optional(
+                  Type.String({
+                    description:
+                      "Free-text note. Narrative only — does not satisfy the requirement.",
+                  }),
+                ),
               },
               { additionalProperties: false },
             ),
+          ),
+          noProofReason: Type.Optional(
+            Type.String({
+              description:
+                "Why this card has no command or url. Use ONLY when no artifact genuinely exists. " +
+                "Completes the card and records the reason as an unknown-status proof entry.",
+            }),
           ),
           artifacts: Type.Optional(
             Type.Array(
@@ -522,9 +646,51 @@ export function createWorkboardTools(params: {
         { additionalProperties: false },
       ),
       execute: async (_toolCallId, rawParams) => {
-        return runClaimedCardMutation(rawParams, (id, record, scope) =>
-          store.complete(id, record, scope),
-        );
+        // The gate runs INSIDE the mutation callback, which means after
+        // readClaimedCardToolParams has verified the caller owns the claim.
+        // Authorization first: a caller who does not hold the card must be told
+        // that, not handed the evidence rules for someone else's work. Running
+        // it before the claim check turned "card must be claimed" into
+        // "no verifiable evidence" for every unauthorized completion.
+        return runClaimedCardMutation(rawParams, (id, record, scope) => {
+          const input = record as {
+            proof?: ProofLike;
+            noProofReason?: unknown;
+          };
+          const mode = requireProofMode();
+          const reason = hasText(input.noProofReason) ? String(input.noProofReason) : null;
+          let proofOverride: ProofLike | undefined;
+
+          if (mode !== "off" && !hasVerifiableEvidence(input)) {
+            // The escape hatch and the refusal share one branch on purpose:
+            // both are the "no checkable reference" case, and the only
+            // difference is whether the worker said why. In `warn` the absence
+            // is recorded exactly as it would be under `enforce`, so changing
+            // mode changes what is blocked, never what is written.
+            if (reason) {
+              proofOverride = noProofEntry(reason);
+            } else if (mode === "enforce") {
+              throw evidenceRefusal(id);
+            } else {
+              proofOverride = noProofEntry(
+                "no verifiable evidence supplied; recorded under OPENCLAW_WORKBOARD_REQUIRE_PROOF=warn",
+              );
+            }
+          }
+
+          // `noProofReason` is a gate parameter, not a store field — consumed
+          // here and materialized as the proof entry above. Strip it so the
+          // store only ever sees its own input shape.
+          const { noProofReason: _consumed, ...forwarded } = input;
+          return store.complete(
+            id,
+            {
+              ...forwarded,
+              ...(proofOverride === undefined ? {} : { proof: proofOverride }),
+            },
+            scope,
+          );
+        });
       },
     },
     {

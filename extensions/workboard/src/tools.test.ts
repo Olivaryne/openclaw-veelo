@@ -640,4 +640,104 @@ describe("workboard tools", () => {
     );
     expect(claimed.card).toMatchObject({ status: "review" });
   });
+
+  describe("workboard_complete evidence gate", () => {
+    // Between 2026-07-21 and 2026-08-04, 31 cards reached `done` through this
+    // tool with zero proof entries. The closer and the CLI both refused a
+    // completion carrying nothing checkable; this tool did not, and the
+    // dispatcher prompt points every worker at it.
+    async function claimedCard(env?: string) {
+      if (env === undefined) delete process.env.OPENCLAW_WORKBOARD_REQUIRE_PROOF;
+      else process.env.OPENCLAW_WORKBOARD_REQUIRE_PROOF = env;
+      const store = new WorkboardStore(createMemoryStore());
+      const api = { runtime: {} } as unknown as OpenClawPluginApi;
+      const tools = new Map(
+        createWorkboardTools({ api, store, context: { agentId: "main" } }).map((t) => [t.name, t]),
+      );
+      const created = readPayload(
+        await tools.get("workboard_create")?.execute("c", { title: "Work", agentId: "main" }),
+      );
+      const id = (created.card as { id: string }).id;
+      const claimed = readPayload(await tools.get("workboard_claim")?.execute("k", { id }));
+      return { tools, id, token: (claimed.token as string | undefined) ?? "" };
+    }
+
+    it("refuses a completion carrying only prose", async () => {
+      const { tools, id, token } = await claimedCard("enforce");
+      await expect(
+        tools.get("workboard_complete")?.execute("x", {
+          id,
+          token,
+          summary: "Ran the suite, everything passed, 158/158.",
+          proof: { status: "passed", note: "all green" },
+        }),
+      ).rejects.toThrow(/no verifiable evidence/);
+    });
+
+    it("accepts a command or a url", async () => {
+      // proofId is not tested here: the store requires an accompanying proof
+      // object whenever one is supplied, so the object is always what the gate
+      // judges. That is why proofId is not a pass condition of its own.
+      for (const evidence of [
+        { proof: { command: "npm test # card abc" } },
+        { proof: { url: "https://github.com/o/r/pull/1" } },
+        { proof: { status: "passed", label: "suite", command: "vitest run" } },
+      ]) {
+        const { tools, id, token } = await claimedCard("enforce");
+        const done = readPayload(
+          await tools.get("workboard_complete")?.execute("x", { id, token, ...evidence }),
+        );
+        expect(done.card).toMatchObject({ status: "done" });
+      }
+    });
+
+    it("noProofReason always completes and records the absence as auditable", async () => {
+      const { tools, id, token } = await claimedCard("enforce");
+      const done = readPayload(
+        await tools.get("workboard_complete")?.execute("x", {
+          id,
+          token,
+          summary: "Read-only investigation.",
+          noProofReason: "discussion card — nothing to run or open",
+        }),
+      );
+      const card = done.card as { status: string; metadata?: { proof?: unknown[] } };
+      expect(card.status).toBe("done");
+      // The escape hatch must not become a silent bypass: the reason is written
+      // where the done-without-proof audit can see it.
+      const proof = (card.metadata?.proof ?? []) as Array<Record<string, unknown>>;
+      expect(proof).toHaveLength(1);
+      expect(proof[0]).toMatchObject({ status: "unknown" });
+      expect(String(proof[0].note)).toContain("discussion card");
+    });
+
+    it("warn mode completes but still records the absence", async () => {
+      const { tools, id, token } = await claimedCard("warn");
+      const done = readPayload(
+        await tools.get("workboard_complete")?.execute("x", { id, token, summary: "done" }),
+      );
+      const card = done.card as { status: string; metadata?: { proof?: unknown[] } };
+      expect(card.status).toBe("done");
+      const proof = (card.metadata?.proof ?? []) as Array<Record<string, unknown>>;
+      expect(proof).toHaveLength(1);
+      expect(proof[0]).toMatchObject({ status: "unknown" });
+    });
+
+    it("off mode restores legacy behavior: proofless completion, no entry", async () => {
+      const { tools, id, token } = await claimedCard("off");
+      const done = readPayload(
+        await tools.get("workboard_complete")?.execute("x", { id, token, summary: "done" }),
+      );
+      const card = done.card as { status: string; metadata?: { proof?: unknown[] } };
+      expect(card.status).toBe("done");
+      expect(card.metadata?.proof ?? []).toHaveLength(0);
+    });
+
+    it("defaults to enforce when the variable is unset", async () => {
+      const { tools, id, token } = await claimedCard(undefined);
+      await expect(
+        tools.get("workboard_complete")?.execute("x", { id, token, summary: "done" }),
+      ).rejects.toThrow(/no verifiable evidence/);
+    });
+  });
 });

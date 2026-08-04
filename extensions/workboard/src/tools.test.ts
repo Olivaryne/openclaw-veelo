@@ -539,8 +539,17 @@ describe("workboard tools", () => {
       expect(String(done.proof[0].note)).toContain("discussion card");
     });
 
-    it("warn is the default: completes, and still records the absence", async () => {
-      for (const env of ["warn", undefined]) {
+    it("enforce is the default, and an unrecognized value fails closed", async () => {
+      for (const env of [undefined, "ENFORCE", "yes-please", ""]) {
+        const { tools, id, token } = await claimedCard(env);
+        await expect(
+          tools.get("workboard_complete")?.execute("x", { id, token, summary: "done" }),
+        ).rejects.toThrow(/no verifiable evidence/);
+      }
+    });
+
+    it("warn completes, and still records the absence", async () => {
+      for (const env of ["warn"]) {
         const { tools, id, token } = await claimedCard(env);
         const done = proofOf(
           readPayload(

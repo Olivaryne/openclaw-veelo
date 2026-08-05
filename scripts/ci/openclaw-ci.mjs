@@ -677,8 +677,16 @@ export function validateWorkflowText(text) {
     "name: static-and-blast-radius-verification",
     "name: bounded-receipt",
     "validate-attestation",
+    // The aut-wb attestation line exists in BOTH workflow epochs (the OT-GOV-4
+    // workflow keeps it as a compatibility validation), so it is the required
+    // anti-tamper fragment. The ot-gov-4 line exists only in the post-binding
+    // workflow and must NOT be required: the governed PR (#19) carries the
+    // pre-binding workflow in its source tree, and requiring the new line
+    // would make the source-workflow validation unsatisfiable for exactly the
+    // PR this binding exists to verify. Attestation-path SAFETY does not live
+    // here — every --parent-attestation is prefix-checked against the trusted
+    // directory and resolved against the closed TRUSTED_ATTESTATION_PATHS list.
     "--parent-attestation trusted/ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
-    "--parent-attestation trusted/ci/openclaw/attestations/ot-gov-4-parent-contract.v1.json",
     "corepack pnpm install --frozen-lockfile",
     "node scripts/run-vitest.mjs extensions/workboard",
     'OPENCLAW_REQUIRE_ROLLBACK_FIXTURE: "1"',

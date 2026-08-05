@@ -1747,16 +1747,10 @@ describe("OT-GOV-4 start authority (process races and crash points)", () => {
           }
         ).reason_code,
     );
+    // §11 row 4, exact (F5 correction; Round-2 residual closed): one reserved,
+    // 15 refused already_reserved — the reservation refusal outranks CAS.
     expect(reasons.filter((r) => r === "workboard_start_reserved")).toHaveLength(1);
-    expect(
-      reasons.filter(
-        (r) =>
-          r === "workboard_start_already_reserved" ||
-          r === "workboard_start_state_conflict" ||
-          r === "workboard_start_already_claimed" ||
-          r === "workboard_start_active_execution",
-      ),
-    ).toHaveLength(n - 1);
+    expect(reasons.filter((r) => r === "workboard_start_already_reserved")).toHaveLength(n - 1);
     expect(reservationCount(dbPath, card.id)).toBe(1);
   });
 

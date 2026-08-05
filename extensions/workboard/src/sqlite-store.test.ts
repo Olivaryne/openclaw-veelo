@@ -100,6 +100,38 @@ async function runAtomicDriver(): Promise<void> {
     process.stdout.write("opened\n");
     return;
   }
+  if (mode === "start") {
+    // OT-GOV-4 driver: one startCardIfEligible call from a real OS process.
+    const outFile = process.env.WB_DRIVER_OUT;
+    const readyFile = process.env.WB_DRIVER_READY;
+    const goFile = process.env.WB_DRIVER_GO;
+    const { stores, store } = openStore(dbPath);
+    try {
+      const request = JSON.parse(process.env.WB_DRIVER_START_REQUEST ?? "{}") as Record<
+        string,
+        unknown
+      >;
+      if (readyFile) {
+        fs.writeFileSync(readyFile, String(process.pid));
+      }
+      if (goFile) {
+        const deadline = Date.now() + 30_000;
+        while (!fs.existsSync(goFile)) {
+          if (Date.now() > deadline) {
+            throw new Error("start driver barrier timed out");
+          }
+          await sleep(2);
+        }
+      }
+      const result = await store.startCardIfEligible(request);
+      if (outFile) {
+        fs.writeFileSync(outFile, JSON.stringify(result));
+      }
+    } finally {
+      stores.close();
+    }
+    return;
+  }
   const automationId = process.env.WB_DRIVER_AUTOMATION_ID ?? "aut-test.daily-brief";
   const scheduledAt = process.env.WB_DRIVER_SCHEDULED_AT ?? "2026-08-03T12:00:00.000Z";
   const readyFile = process.env.WB_DRIVER_READY;
@@ -261,6 +293,10 @@ function makeSchema2Fixture(dbPath: string, legacyAutomationJson: string[] = [])
   const db = new DatabaseSync(dbPath);
   try {
     db.exec(`
+      DROP TRIGGER workboard_cards_reserved_no_delete;
+      DROP TABLE workboard_start_receipts;
+      DROP TABLE workboard_card_start_reservations;
+      DELETE FROM workboard_schema_migrations WHERE id IN ('schema-4', 'schema-4-ot-gov-4');
       DROP TRIGGER workboard_cards_atomic_tuple_complete_insert;
       DROP TRIGGER workboard_cards_atomic_tuple_complete_update;
       DROP TRIGGER workboard_cards_atomic_tuple_immutable;
@@ -330,7 +366,13 @@ describe("workboard atomic schema-3 migration", () => {
           id: string;
         }>
       ).map((row) => row.id);
-      expect(ledger).toEqual(["schema-2", "schema-3", "schema-3-aut-wb-atomic"]);
+      expect(ledger).toEqual([
+        "schema-2",
+        "schema-3",
+        "schema-3-aut-wb-atomic",
+        "schema-4",
+        "schema-4-ot-gov-4",
+      ]);
       const columns = new Set(
         (db.prepare("PRAGMA table_info(workboard_cards)").all() as Array<{ name: string }>).map(
           (row) => row.name,
@@ -1072,7 +1114,13 @@ describe("workboard atomic rollback compatibility (A35)", () => {
           .all() as Array<{ id: string }>
       ).map((row) => row.id);
       dbAfterOpen.close();
-      expect(ledger).toEqual(["schema-2", "schema-3", "schema-3-aut-wb-atomic"]);
+      expect(ledger).toEqual([
+        "schema-2",
+        "schema-3",
+        "schema-3-aut-wb-atomic",
+        "schema-4",
+        "schema-4-ot-gov-4",
+      ]);
       // 2. Old lookup reads the correlated card.
       const oldRead = await oldStores.cards.lookup(cardId);
       expect(oldRead?.version).toBe(1);
@@ -1277,7 +1325,13 @@ describe("workboard atomic legacy authority (Round-1 defect 2)", () => {
       .get() as { n: number | bigint };
     db.close();
     expect(Number(adopted.n)).toBe(0);
-    expect(migrationLedger(dbPath)).toEqual(["schema-2", "schema-3", "schema-3-aut-wb-atomic"]);
+    expect(migrationLedger(dbPath)).toEqual([
+      "schema-2",
+      "schema-3",
+      "schema-3-aut-wb-atomic",
+      "schema-4",
+      "schema-4-ot-gov-4",
+    ]);
   });
 
   it("migration refuses a malformed unrelated payload (frozen migration policy)", () => {
@@ -1560,6 +1614,432 @@ describe("workboard atomic receipt authority (Round-1 defect 5)", () => {
       });
     } finally {
       stores.close();
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OT-GOV-4 — start authority: real-process races, crash points, restart, and
+// migration interruption (contract §10, matrix rows [R3][R4][R27][R28][R29]
+// [R34], migration §12). Same self-re-execution driver as the atomic suite.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("OT-GOV-4 start authority (process races and crash points)", () => {
+  function makeStartRequest(
+    card: { id: string; status: string; updatedAt: number },
+    attemptId: string,
+    over: Record<string, unknown> = {},
+  ) {
+    return {
+      schema_version: 1,
+      card_id: card.id,
+      attempt_id: attemptId,
+      authority_id: "veelo-start-authority",
+      expected_status: card.status,
+      expected_updated_at: card.updatedAt,
+      required_dependency_state: "none",
+      forbidden_labels: ["hold", "operator-merge-only", "operator-controlled"],
+      expected_assignee: null,
+      worker: { engine: "codex", mode: "exec", model: null, session_key: null },
+      ...over,
+    };
+  }
+
+  async function seedReadyCard(
+    dbPath: string,
+  ): Promise<{ id: string; status: string; updatedAt: number }> {
+    const { stores, store } = openStore(dbPath);
+    try {
+      const card = await store.create({ title: "start race card", status: "ready" });
+      const fresh = await store.get(card.id);
+      return { id: card.id, status: fresh?.status ?? "ready", updatedAt: fresh?.updatedAt ?? 0 };
+    } finally {
+      stores.close();
+    }
+  }
+
+  function reservationCount(dbPath: string, cardId: string): number {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const row = db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM workboard_card_start_reservations WHERE card_id = ? AND released_at IS NULL",
+        )
+        .get(cardId) as { n: number | bigint };
+      return Number(row.n);
+    } finally {
+      db.close();
+    }
+  }
+
+  it("[R3] two OS processes with the IDENTICAL request produce exactly one reservation", async () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    const card = await seedReadyCard(dbPath);
+    const attemptId = crypto.randomUUID().toLowerCase();
+    const request = makeStartRequest(card, attemptId);
+    const go = path.join(workDir, "go");
+    const children = [0, 1].map((i) =>
+      spawnDriver({
+        dbPath,
+        mode: "start",
+        ready: path.join(workDir, `ready-${i}`),
+        go,
+        out: path.join(workDir, `out-${i}`),
+        extraEnv: { WB_DRIVER_START_REQUEST: JSON.stringify(request) },
+      }),
+    );
+    const deadline = Date.now() + 30_000;
+    while (![0, 1].every((i) => fs.existsSync(path.join(workDir, `ready-${i}`)))) {
+      if (Date.now() > deadline) throw new Error("children never became ready");
+      await sleep(5);
+    }
+    fs.writeFileSync(go, "go");
+    await Promise.all(children.map((child) => waitForExit(child)));
+    const results = [0, 1].map(
+      (i) =>
+        JSON.parse(fs.readFileSync(path.join(workDir, `out-${i}`), "utf8")) as {
+          reason_code: string;
+        },
+    );
+    const reasons = results.map((r) => r.reason_code).sort();
+    // Exactly one reserved; the loser of the race recovers the SAME reservation
+    // (identical attempt_id) — never a second row [R3].
+    expect(reasons).toEqual(["workboard_start_recovered", "workboard_start_reserved"]);
+    expect(reservationCount(dbPath, card.id)).toBe(1);
+  });
+
+  it("[R4] 16 concurrent callers with DISTINCT attempts: one reserved, 15 refused already_reserved", async () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    const card = await seedReadyCard(dbPath);
+    const go = path.join(workDir, "go16");
+    const n = 16;
+    const children = Array.from({ length: n }, (_, i) =>
+      spawnDriver({
+        dbPath,
+        mode: "start",
+        ready: path.join(workDir, `r16-${i}`),
+        go,
+        out: path.join(workDir, `o16-${i}`),
+        extraEnv: {
+          WB_DRIVER_START_REQUEST: JSON.stringify(
+            makeStartRequest(card, crypto.randomUUID().toLowerCase()),
+          ),
+        },
+      }),
+    );
+    const deadline = Date.now() + 60_000;
+    while (
+      !Array.from({ length: n }, (_, i) => path.join(workDir, `r16-${i}`)).every((f) =>
+        fs.existsSync(f),
+      )
+    ) {
+      if (Date.now() > deadline) throw new Error("16 children never became ready");
+      await sleep(5);
+    }
+    fs.writeFileSync(go, "go");
+    await Promise.all(children.map((child) => waitForExit(child)));
+    const reasons = Array.from(
+      { length: n },
+      (_, i) =>
+        (
+          JSON.parse(fs.readFileSync(path.join(workDir, `o16-${i}`), "utf8")) as {
+            reason_code: string;
+          }
+        ).reason_code,
+    );
+    expect(reasons.filter((r) => r === "workboard_start_reserved")).toHaveLength(1);
+    expect(
+      reasons.filter(
+        (r) =>
+          r === "workboard_start_already_reserved" ||
+          r === "workboard_start_state_conflict" ||
+          r === "workboard_start_already_claimed" ||
+          r === "workboard_start_active_execution",
+      ),
+    ).toHaveLength(n - 1);
+    expect(reservationCount(dbPath, card.id)).toBe(1);
+  });
+
+  it("[R27] crash before COMMIT persists nothing; a replay reserves cleanly", async () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    const card = await seedReadyCard(dbPath);
+    const attemptId = crypto.randomUUID().toLowerCase();
+    const child = spawnDriver({
+      dbPath,
+      mode: "start",
+      out: path.join(workDir, "crash-out"),
+      extraEnv: {
+        WB_DRIVER_START_REQUEST: JSON.stringify(makeStartRequest(card, attemptId)),
+        OPENCLAW_WORKBOARD_TEST_ATOMIC_CRASH: "start-before-commit",
+      },
+    });
+    const exit = await waitForExit(child);
+    expect(exit.code).not.toBe(0);
+    expect(reservationCount(dbPath, card.id)).toBe(0);
+    const db = new DatabaseSync(dbPath);
+    const receipts = db
+      .prepare("SELECT COUNT(*) AS n FROM workboard_start_receipts WHERE card_id = ?")
+      .get(card.id) as { n: number | bigint };
+    const cardRow = db
+      .prepare("SELECT status, claim_json FROM workboard_cards WHERE id = ?")
+      .get(card.id) as { status: string; claim_json: string | null };
+    db.close();
+    expect(Number(receipts.n)).toBe(0);
+    expect(cardRow.status).toBe("ready");
+    expect(cardRow.claim_json).toBeNull();
+    // Replay of the same attempt reserves cleanly [R27].
+    const { stores, store } = openStore(dbPath);
+    try {
+      const fresh = await store.get(card.id);
+      const replay = await store.startCardIfEligible(
+        makeStartRequest(
+          { id: card.id, status: fresh?.status ?? "ready", updatedAt: fresh?.updatedAt ?? 0 },
+          attemptId,
+        ),
+      );
+      expect(replay.reason_code).toBe("workboard_start_reserved");
+    } finally {
+      stores.close();
+    }
+  });
+
+  it("[R28] crash after COMMIT, before the response: replay of the same attempt returns recovered", async () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    const card = await seedReadyCard(dbPath);
+    const attemptId = crypto.randomUUID().toLowerCase();
+    const child = spawnDriver({
+      dbPath,
+      mode: "start",
+      out: path.join(workDir, "crash28-out"),
+      extraEnv: {
+        WB_DRIVER_START_REQUEST: JSON.stringify(makeStartRequest(card, attemptId)),
+        OPENCLAW_WORKBOARD_TEST_ATOMIC_CRASH: "start-after-commit",
+      },
+    });
+    const exit = await waitForExit(child);
+    expect(exit.code).not.toBe(0);
+    // The reservation committed even though the caller never saw the response.
+    expect(reservationCount(dbPath, card.id)).toBe(1);
+    const { stores, store } = openStore(dbPath);
+    try {
+      const fresh = await store.get(card.id);
+      const replay = await store.startCardIfEligible(
+        makeStartRequest(
+          { id: card.id, status: fresh?.status ?? "running", updatedAt: fresh?.updatedAt ?? 0 },
+          attemptId,
+        ),
+      );
+      expect(replay.reason_code).toBe("workboard_start_recovered");
+      expect(reservationCount(dbPath, card.id)).toBe(1);
+    } finally {
+      stores.close();
+    }
+  });
+
+  it("[R29][R34] an orphaned reservation survives restart, still blocks, is age-detectable, and neutrally releases", async () => {
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    const card = await seedReadyCard(dbPath);
+    const attemptId = crypto.randomUUID().toLowerCase();
+    // Reserve in a separate process (worker never created — the orphan case).
+    const child = spawnDriver({
+      dbPath,
+      mode: "start",
+      out: path.join(workDir, "orphan-out"),
+      extraEnv: { WB_DRIVER_START_REQUEST: JSON.stringify(makeStartRequest(card, attemptId)) },
+    });
+    await waitForExit(child);
+    const envelope = JSON.parse(fs.readFileSync(path.join(workDir, "orphan-out"), "utf8")) as {
+      reason_code: string;
+      reservation: {
+        reservation_id: string;
+        attempt_id: string;
+        expires_at: number;
+        worker_bound: boolean;
+      };
+    };
+    expect(envelope.reason_code).toBe("workboard_start_reserved");
+    expect(envelope.reservation.worker_bound).toBe(false);
+    // "Restart": a fresh store over the same file [R34].
+    const { stores, store } = openStore(dbPath);
+    try {
+      // Still blocks a different attempt.
+      const fresh = await store.get(card.id);
+      const blocked = await store.startCardIfEligible(
+        makeStartRequest(
+          { id: card.id, status: fresh?.status ?? "running", updatedAt: fresh?.updatedAt ?? 0 },
+          crypto.randomUUID().toLowerCase(),
+          { expected_assignee: fresh?.agentId ?? null },
+        ),
+      );
+      expect([
+        "workboard_start_already_reserved",
+        "workboard_start_already_claimed",
+        "workboard_start_active_execution",
+      ]).toContain(blocked.reason_code);
+      // Orphan age is detectable from expires_at [R29].
+      expect(envelope.reservation.expires_at).toBeGreaterThan(Date.now() - 60_000);
+      // Neutral release recovers the card without a failure mark.
+      const release = await store.releaseStartReservation({
+        schema_version: 1,
+        reservation_id: envelope.reservation.reservation_id,
+        attempt_id: envelope.reservation.attempt_id,
+        reason: "orphan-recovery",
+      });
+      expect(release.reason_code).toBe("workboard_start_released");
+      const after = await store.get(card.id);
+      expect(after?.status).toBe("ready");
+      expect(after?.metadata?.failureCount ?? 0).toBe(0);
+    } finally {
+      stores.close();
+    }
+  });
+
+  for (const crashPoint of [
+    "start-migration-ddl",
+    "start-migration-index",
+    "start-migration-ledger",
+  ]) {
+    it(`schema-4 migration interrupted at ${crashPoint} is all-or-nothing and completes on reopen`, async () => {
+      const dbPath = path.join(workDir, "workboard.sqlite");
+      // Build a schema-3 database with NO schema-4 (strip it after open).
+      const first = openStore(dbPath);
+      first.stores.close();
+      const db = new DatabaseSync(dbPath);
+      db.exec("DROP TRIGGER workboard_cards_reserved_no_delete");
+      db.exec("DROP TABLE workboard_start_receipts");
+      db.exec("DROP TABLE workboard_card_start_reservations");
+      db.prepare(
+        "DELETE FROM workboard_schema_migrations WHERE id IN ('schema-4','schema-4-ot-gov-4')",
+      ).run();
+      db.close();
+      // Interrupt the migration mid-flight in a child process.
+      const child = spawnDriver({
+        dbPath,
+        mode: "open-only",
+        extraEnv: { OPENCLAW_WORKBOARD_TEST_ATOMIC_CRASH: crashPoint },
+      });
+      const exit = await waitForExit(child);
+      expect(exit.code).not.toBe(0);
+      // All-or-nothing: either no schema-4 ledger rows, or all of them.
+      const check = new DatabaseSync(dbPath);
+      const ledger = (
+        check
+          .prepare(
+            "SELECT id FROM workboard_schema_migrations WHERE id LIKE 'schema-4%' ORDER BY id",
+          )
+          .all() as Array<{ id: string }>
+      ).map((row) => row.id);
+      check.close();
+      expect([0, 2]).toContain(ledger.length);
+      // Reopen completes the migration cleanly.
+      const again = openStore(dbPath);
+      try {
+        const card = await again.store.create({ title: "post-interrupt", status: "ready" });
+        const fresh = await again.store.get(card.id);
+        const response = await again.store.startCardIfEligible(
+          makeStartRequest(
+            { id: card.id, status: fresh?.status ?? "ready", updatedAt: fresh?.updatedAt ?? 0 },
+            crypto.randomUUID().toLowerCase(),
+          ),
+        );
+        expect(response.reason_code).toBe("workboard_start_reserved");
+      } finally {
+        again.stores.close();
+      }
+    });
+  }
+
+  it("[R40] the rollback binary opens schema-4, preserves reservation rows, and cannot delete a reserved card", async () => {
+    const bundlePath = (() => {
+      const override = process.env.OPENCLAW_ROLLBACK_BUNDLE;
+      if (override) {
+        return fs.existsSync(override) ? override : null;
+      }
+      const installRoot = path.join(os.homedir(), ".npm-global", "lib", "node_modules", "openclaw");
+      try {
+        const candidate = fs
+          .readdirSync(path.join(installRoot, "dist"))
+          .find((name) => /^sqlite-store-.*\.js$/.test(name));
+        return candidate ? path.join(installRoot, "dist", candidate) : null;
+      } catch {
+        return null;
+      }
+    })();
+    if (!bundlePath && !process.env.OPENCLAW_REQUIRE_ROLLBACK_FIXTURE) {
+      console.warn(
+        "R40 rollback fixture skipped: no installed openclaw bundle resolvable. Set OPENCLAW_ROLLBACK_BUNDLE.",
+      );
+      return;
+    }
+    expect(bundlePath).toBeTruthy();
+    const dbPath = path.join(workDir, "workboard.sqlite");
+    const card = await seedReadyCard(dbPath);
+    const { stores, store } = openStore(dbPath);
+    let reservationId: string;
+    try {
+      const fresh = await store.get(card.id);
+      const reserved = await store.startCardIfEligible(
+        makeStartRequest(
+          { id: card.id, status: fresh?.status ?? "ready", updatedAt: fresh?.updatedAt ?? 0 },
+          crypto.randomUUID().toLowerCase(),
+        ),
+      );
+      expect(reserved.reason_code).toBe("workboard_start_reserved");
+      reservationId = reserved.reservation?.reservation_id as string;
+    } finally {
+      stores.close();
+    }
+    const rowBefore = JSON.stringify(
+      new DatabaseSync(dbPath)
+        .prepare("SELECT * FROM workboard_card_start_reservations WHERE reservation_id = ?")
+        .get(reservationId),
+    );
+    const bundle = (await import(bundlePath as string)) as Record<string, unknown>;
+    const openOldStores = Object.values(bundle).find(
+      (
+        value,
+      ): value is (options: { dbPath: string }) => {
+        cards: {
+          lookup: (
+            key: string,
+          ) => Promise<{ version: 1; card: Record<string, unknown> } | undefined>;
+          register: (key: string, value: unknown) => Promise<void>;
+          delete: (key: string) => Promise<boolean>;
+        };
+        close: () => void;
+      } => typeof value === "function" && String(value).includes("createWorkboardSqliteStores"),
+    );
+    expect(openOldStores).toBeTruthy();
+    const oldStores = openOldStores!({ dbPath });
+    try {
+      // Old binary reads the reserved card.
+      const oldRead = await oldStores.cards.lookup(card.id);
+      expect(oldRead?.version).toBe(1);
+      // Old generic register performs an ordinary edit; the reservation row survives byte-for-byte.
+      await oldStores.cards.register(card.id, {
+        version: 1,
+        card: { ...(oldRead?.card ?? {}), title: "rollback edit with live reservation" },
+      });
+      const rowAfter = JSON.stringify(
+        new DatabaseSync(dbPath)
+          .prepare("SELECT * FROM workboard_card_start_reservations WHERE reservation_id = ?")
+          .get(reservationId),
+      );
+      expect(rowAfter).toBe(rowBefore);
+      // Old delete of the reserved card fails closed (schema-4 trigger).
+      let deleted = false;
+      try {
+        deleted = await oldStores.cards.delete(card.id);
+      } catch {
+        deleted = false;
+      }
+      expect(deleted).toBe(false);
+      const still = new DatabaseSync(dbPath)
+        .prepare("SELECT COUNT(*) AS n FROM workboard_cards WHERE id = ?")
+        .get(card.id) as { n: number | bigint };
+      expect(Number(still.n)).toBe(1);
+    } finally {
+      oldStores.close();
     }
   });
 });

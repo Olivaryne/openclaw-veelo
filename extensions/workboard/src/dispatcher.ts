@@ -63,14 +63,14 @@ function cardIsArchived(card: WorkboardCard): boolean {
   return Boolean(card.metadata?.archivedAt);
 }
 
-function buildSessionKey(card: WorkboardCard): string {
+export function buildSessionKey(card: WorkboardCard): string {
   const boardId = sanitizeSessionSegment(cardBoardId(card), "default");
   const cardId = sanitizeSessionSegment(card.id, "card");
   const suffix = `subagent:workboard-${boardId}-${cardId}`;
   return card.agentId ? `agent:${sanitizeSessionSegment(card.agentId, "agent")}:${suffix}` : suffix;
 }
 
-function buildExecution(params: {
+export function buildExecution(params: {
   card: WorkboardCard;
   sessionKey: string;
   runId: string;
@@ -99,7 +99,7 @@ function managedWorktreeName(cardId: string): string {
   return `wb-${suffix}`.slice(0, 64).replace(/-$/, "");
 }
 
-async function materializeWorkspace(params: {
+export async function materializeWorkspace(params: {
   card: WorkboardCard;
   worktrees?: WorkboardWorktreeRuntime;
   allowManagedWorktrees: boolean;
@@ -138,7 +138,7 @@ async function materializeWorkspace(params: {
   };
 }
 
-function buildWorkerPrompt(params: {
+export function buildWorkerPrompt(params: {
   card: WorkboardCard;
   context: string;
   ownerId: string;

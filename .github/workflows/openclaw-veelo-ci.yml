@@ -59,10 +59,10 @@ jobs:
           node trusted/scripts/ci/openclaw-ci.mjs validate-workflow \
             --workflow trusted/.github/workflows/openclaw-veelo-ci.yml
           node trusted/scripts/ci/openclaw-ci.mjs validate-target \
-            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json
+            --manifest trusted/ci/openclaw/ot-gov-4b.json
           node trusted/scripts/ci/openclaw-ci.mjs validate-attestation \
-            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json \
-            --parent-attestation trusted/ci/openclaw/attestations/aut-wb-parent-contract.v1.json
+            --manifest trusted/ci/openclaw/ot-gov-4b.json \
+            --parent-attestation trusted/ci/openclaw/attestations/ot-gov-4-parent-contract.v1.json
 
       - name: Validate source workflow when present
         shell: bash
@@ -99,7 +99,7 @@ jobs:
           set -euo pipefail
           node trusted/scripts/ci/openclaw-ci.mjs verify-pr \
             --source source \
-            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json \
+            --manifest trusted/ci/openclaw/ot-gov-4b.json \
             --repository "$PR_REPOSITORY" \
             --pr-number "$PR_NUMBER" \
             --base-branch "$PR_BASE_BRANCH" \
@@ -115,8 +115,12 @@ jobs:
           set -euo pipefail
           node trusted/scripts/ci/openclaw-ci.mjs verify-contracts \
             --source source \
-            --parent-attestation trusted/ci/openclaw/attestations/aut-wb-parent-contract.v1.json \
-            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json
+            --parent-attestation trusted/ci/openclaw/attestations/ot-gov-4-parent-contract.v1.json \
+            --manifest trusted/ci/openclaw/ot-gov-4b.json
+          # Compatibility validation of the prior governed target's attestation.
+          node trusted/scripts/ci/openclaw-ci.mjs validate-attestation \
+            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json \
+            --parent-attestation trusted/ci/openclaw/attestations/aut-wb-parent-contract.v1.json
 
   focused:
     name: workboard-focused-verification
@@ -215,7 +219,7 @@ jobs:
         run: |
           set -euo pipefail
           node trusted/scripts/ci/openclaw-ci.mjs prepare-rollback \
-            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json \
+            --manifest trusted/ci/openclaw/ot-gov-4b.json \
             --output-dir '${{ runner.temp }}/openclaw-rollback-package' \
             --github-output "$GITHUB_OUTPUT"
 
@@ -381,7 +385,7 @@ jobs:
         run: |
           set -euo pipefail
           node trusted/scripts/ci/openclaw-ci.mjs generate-receipt \
-            --manifest trusted/ci/openclaw/aut-wb-atomic-srv-1.json \
+            --manifest trusted/ci/openclaw/ot-gov-4b.json \
             --output-dir '${{ runner.temp }}/openclaw-ci-receipt'
 
       - name: Upload bounded receipt files only

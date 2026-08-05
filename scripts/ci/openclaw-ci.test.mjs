@@ -360,7 +360,9 @@ const workflowMutations = [
   ],
   [
     "missing attestation validation",
-    "validate-attestation",
+    // The workflow now validates two attestations (AUT-WB compatibility +
+    // OT-GOV-4), so the mutation must strip every occurrence.
+    /validate-attestation/g,
     "validate-nothing",
     /missing required fragment: validate-attestation/,
   ],
@@ -685,7 +687,7 @@ test("absolute and lookalike attestation paths are refused despite valid content
           manifest,
           base,
         ),
-      /must be exactly/,
+      /must be one of/,
     );
     // 4. embedded lookalike prefix
     assert.throws(
@@ -695,7 +697,7 @@ test("absolute and lookalike attestation paths are refused despite valid content
           manifest,
           base,
         ),
-      /must be exactly/,
+      /must be one of/,
     );
     // untrusted source-checkout lookalike stays refused
     assert.throws(
@@ -705,7 +707,7 @@ test("absolute and lookalike attestation paths are refused despite valid content
           manifest,
           base,
         ),
-      /must be exactly/,
+      /must be one of/,
     );
     // 5. dot-dot traversal
     assert.throws(

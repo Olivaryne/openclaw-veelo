@@ -4426,3 +4426,669 @@ describe("AUT-WB-ATOMIC escaped legacy key at the store boundary (Round-1 defect
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OT-GOV-4 — atomic per-card worker-start authority (contract v1).
+// Matrix rows are cited as [Rn]. Every refusal asserts ZERO MUTATION (§6.8) by
+// byte-comparing the card row, labels, attempts, events, claim, and the
+// reservation table before and after the call.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("OT-GOV-4 start authority (store layer)", () => {
+  function openStartStore() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wb-start-"));
+    const dbPath = path.join(dir, "workboard.sqlite");
+    const stores = createWorkboardSqliteStores({ dbPath });
+    const store = new WorkboardStore(stores.cards, {
+      boards: stores.boards,
+      subscriptions: stores.subscriptions,
+      attachments: stores.attachments,
+    });
+    return {
+      dir,
+      dbPath,
+      stores,
+      store,
+      close() {
+        stores.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  const UUID = () => crypto.randomUUID().toLowerCase();
+
+  function startRequest(
+    card: { id: string; status: string; updatedAt: number },
+    over: Record<string, unknown> = {},
+  ) {
+    return {
+      schema_version: 1,
+      card_id: card.id,
+      attempt_id: UUID(),
+      authority_id: "veelo-start-authority",
+      expected_status: card.status,
+      expected_updated_at: card.updatedAt,
+      required_dependency_state: "none",
+      forbidden_labels: ["hold", "operator-merge-only", "operator-controlled"],
+      expected_assignee: null,
+      worker: { engine: "codex", mode: "exec", model: null, session_key: null },
+      ...over,
+    };
+  }
+
+  // Full persisted-state snapshot for the zero-mutation assertions.
+  function snapshot(dbPath: string, cardId: string): string {
+    const db = new DatabaseSync(dbPath);
+    const pick = (sql: string) => db.prepare(sql).all(cardId);
+    const state = {
+      card: db.prepare("SELECT * FROM workboard_cards WHERE id = ?").get(cardId),
+      labels: pick("SELECT * FROM workboard_card_labels WHERE card_id = ? ORDER BY ordinal"),
+      attempts: pick("SELECT * FROM workboard_card_attempts WHERE card_id = ? ORDER BY ordinal"),
+      events: pick("SELECT * FROM workboard_card_events WHERE card_id = ? ORDER BY ordinal"),
+      reservations: pick(
+        "SELECT * FROM workboard_card_start_reservations WHERE card_id = ? ORDER BY reserved_at",
+      ),
+      receipts: pick(
+        "SELECT * FROM workboard_start_receipts WHERE card_id = ? ORDER BY created_at",
+      ),
+    };
+    db.close();
+    return JSON.stringify(state);
+  }
+
+  async function expectPureRefusal(
+    ctx: ReturnType<typeof openStartStore>,
+    cardId: string,
+    request: unknown,
+    reason: string,
+  ) {
+    const before = snapshot(ctx.dbPath, cardId);
+    const response = await ctx.store.startCardIfEligible(request);
+    expect(response.reason_code).toBe(reason);
+    expect(response.ok).toBe(false);
+    expect(response.outcome).toBe("refused");
+    expect(response.retryable).toBe(false);
+    expect(response.reservation).toBeNull();
+    expect(response.evidence).toBeNull();
+    expect(snapshot(ctx.dbPath, cardId)).toBe(before);
+    return response;
+  }
+
+  it("[R1] a valid request on an eligible card reserves: one reservation, one attempt, claim set, receipt appended", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "eligible", status: "ready" });
+      const response = await ctx.store.startCardIfEligible(startRequest(card));
+      expect(response.ok).toBe(true);
+      expect(response.outcome).toBe("reserved");
+      expect(response.reason_code).toBe("workboard_start_reserved");
+      expect(response.reservation?.worker_bound).toBe(false);
+      expect(response.evidence?.kind).toBe("workboard_start_receipt");
+      const after = await ctx.store.get(card.id);
+      expect(after?.status).toBe("running");
+      expect(after?.metadata?.claim?.ownerId).toBe("veelo-start-authority");
+      const attempts = after?.metadata?.attempts ?? [];
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]?.status).toBe("reserved");
+      // The receipt is durable and resolvable through the dedicated lookup.
+      const receipt = await ctx.store.getStartReceipt(response.evidence?.ref);
+      expect(receipt.receipt?.reason_code).toBe("workboard_start_reserved");
+      expect(receipt.receipt?.card_id).toBe(card.id);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R2] replay of the same (card_id, attempt_id) recovers without a second row", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "replay", status: "ready" });
+      const request = startRequest(card);
+      const first = await ctx.store.startCardIfEligible(request);
+      expect(first.reason_code).toBe("workboard_start_reserved");
+      const replay = await ctx.store.startCardIfEligible(request);
+      expect(replay.reason_code).toBe("workboard_start_recovered");
+      expect(replay.outcome).toBe("recovered");
+      expect(replay.reservation?.reservation_id).toBe(first.reservation?.reservation_id);
+      // §6.2 — a replay creates NOTHING: the evidence is the ORIGINAL reserved
+      // receipt, and the receipt table does not grow (F4, Round 1).
+      expect(replay.evidence?.ref).toBe(first.evidence?.ref);
+      const db = new DatabaseSync(ctx.dbPath);
+      const rows = db
+        .prepare("SELECT COUNT(*) AS n FROM workboard_card_start_reservations WHERE card_id = ?")
+        .get(card.id) as { n: number | bigint };
+      const attempts = db
+        .prepare("SELECT COUNT(*) AS n FROM workboard_card_attempts WHERE card_id = ?")
+        .get(card.id) as { n: number | bigint };
+      const receipts = db
+        .prepare("SELECT COUNT(*) AS n FROM workboard_start_receipts WHERE card_id = ?")
+        .get(card.id) as { n: number | bigint };
+      db.close();
+      expect(Number(rows.n)).toBe(1);
+      expect(Number(attempts.n)).toBe(1);
+      expect(Number(receipts.n)).toBe(1);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R5][R6][R7] operator-protection labels refuse with zero mutation", async () => {
+    const ctx = openStartStore();
+    try {
+      for (const label of ["hold", "operator-merge-only", "operator-controlled"]) {
+        const card = await ctx.store.create({
+          title: `protected ${label}`,
+          status: "ready",
+          labels: [label],
+        });
+        await expectPureRefusal(ctx, card.id, startRequest(card), "workboard_start_card_protected");
+      }
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R8] a card in review refuses as protected even with matching CAS", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "in review", status: "review" });
+      await expectPureRefusal(
+        ctx,
+        card.id,
+        startRequest({ id: card.id, status: "review", updatedAt: card.updatedAt }),
+        "workboard_start_card_protected",
+      );
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R9] omitting a mandatory forbidden label is request_invalid before any reservation read", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "weak labels", status: "ready" });
+      await expectPureRefusal(
+        ctx,
+        card.id,
+        startRequest(card, { forbidden_labels: ["hold", "operator-merge-only"] }),
+        "workboard_start_request_invalid",
+      );
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R10][R11] parent dependencies gate all_parents_done and only all_parents_done", async () => {
+    const ctx = openStartStore();
+    try {
+      const parent = await ctx.store.create({ title: "parent", status: "todo" });
+      const child = await ctx.store.create({ title: "child", status: "todo" });
+      await ctx.store.linkCards(parent.id, child.id);
+      const linked = await ctx.store.get(child.id);
+      // all_parents_done with an unfinished parent refuses [R10]
+      await expectPureRefusal(
+        ctx,
+        child.id,
+        startRequest(
+          { id: child.id, status: linked?.status ?? "todo", updatedAt: linked?.updatedAt ?? 0 },
+          { required_dependency_state: "all_parents_done" },
+        ),
+        "workboard_start_dependencies_unsatisfied",
+      );
+      // "none" with the same unmet parent reserves [R11]
+      const fresh = await ctx.store.get(child.id);
+      const response = await ctx.store.startCardIfEligible(
+        startRequest(
+          { id: child.id, status: fresh?.status ?? "todo", updatedAt: fresh?.updatedAt ?? 0 },
+          { required_dependency_state: "none" },
+        ),
+      );
+      expect(response.reason_code).toBe("workboard_start_reserved");
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R12][R13][R14] CAS mismatches refuse without mutation", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "cas", status: "ready" });
+      await expectPureRefusal(
+        ctx,
+        card.id,
+        startRequest(card, { expected_status: "todo" }),
+        "workboard_start_state_conflict",
+      );
+      await expectPureRefusal(
+        ctx,
+        card.id,
+        startRequest(card, { expected_updated_at: card.updatedAt + 1 }),
+        "workboard_start_state_conflict",
+      );
+      // [R14] a non-protection label applied between read and call bumps
+      // updated_at, so the stale caller view refuses as state_conflict.
+      const stale = { id: card.id, status: card.status, updatedAt: card.updatedAt };
+      await ctx.store.update(card.id, { labels: ["routine"] });
+      await expectPureRefusal(ctx, card.id, startRequest(stale), "workboard_start_state_conflict");
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R15][R16] a live claim refuses; an expired claim does not block", async () => {
+    const ctx = openStartStore();
+    try {
+      const live = await ctx.store.create({ title: "claimed", status: "ready" });
+      await ctx.store.claim(live.id, { ownerId: "someone", ttlSeconds: 3600 });
+      const claimed = await ctx.store.get(live.id);
+      // claim() moved it to running; present CAS-true values so the claim check
+      // itself is what refuses.
+      await expectPureRefusal(
+        ctx,
+        live.id,
+        startRequest(
+          { id: live.id, status: claimed?.status ?? "running", updatedAt: claimed?.updatedAt ?? 0 },
+          { expected_assignee: claimed?.agentId ?? null },
+        ),
+        "workboard_start_already_claimed",
+      );
+
+      // Expired claim: write one directly, status ready.
+      const expired = await ctx.store.create({ title: "expired claim", status: "ready" });
+      const db = new DatabaseSync(ctx.dbPath);
+      db.prepare("UPDATE workboard_cards SET claim_json = ? WHERE id = ?").run(
+        JSON.stringify({
+          ownerId: "ghost",
+          token: "t",
+          claimedAt: 1,
+          lastHeartbeatAt: 1,
+          expiresAt: 2,
+        }),
+        expired.id,
+      );
+      db.close();
+      const row = await ctx.store.get(expired.id);
+      const response = await ctx.store.startCardIfEligible(
+        startRequest({
+          id: expired.id,
+          status: row?.status ?? "ready",
+          updatedAt: row?.updatedAt ?? 0,
+        }),
+      );
+      expect(response.reason_code).toBe("workboard_start_reserved");
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R17] an active execution refuses", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "executing", status: "ready" });
+      const db = new DatabaseSync(ctx.dbPath);
+      db.prepare(
+        "UPDATE workboard_cards SET execution_id = ?, execution_kind = 'subagent', execution_engine = 'codex', execution_mode = 'exec', execution_status = 'running', execution_model = 'test-model', execution_started_at = 1, execution_updated_at = 1 WHERE id = ?",
+      ).run(crypto.randomUUID(), card.id);
+      db.close();
+      const row = await ctx.store.get(card.id);
+      await expectPureRefusal(
+        ctx,
+        card.id,
+        startRequest({
+          id: card.id,
+          status: row?.status ?? "ready",
+          updatedAt: row?.updatedAt ?? 0,
+        }),
+        "workboard_start_active_execution",
+      );
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R18] an exhausted retry budget refuses", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "budget", status: "ready" });
+      const db = new DatabaseSync(ctx.dbPath);
+      db.prepare(
+        "UPDATE workboard_cards SET automation_json = ?, failure_count = 3 WHERE id = ?",
+      ).run(JSON.stringify({ maxRetries: 2 }), card.id);
+      db.close();
+      const row = await ctx.store.get(card.id);
+      await expectPureRefusal(
+        ctx,
+        card.id,
+        startRequest({
+          id: card.id,
+          status: row?.status ?? "ready",
+          updatedAt: row?.updatedAt ?? 0,
+        }),
+        "workboard_start_retry_budget_exhausted",
+      );
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R19][R20][R21][R22][R23] unknown card, prefix ids, unknown/missing/malformed fields", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "grammar", status: "ready" });
+      // unknown card id (valid UUID, no row) [R19]
+      const missing = await ctx.store.startCardIfEligible(
+        startRequest({ id: UUID(), status: "ready", updatedAt: 1 }),
+      );
+      expect(missing.reason_code).toBe("workboard_start_card_not_found");
+      // prefix instead of exact id [R20]
+      const prefix = await ctx.store.startCardIfEligible(
+        startRequest(card, { card_id: card.id.slice(0, 8) }),
+      );
+      expect(prefix.reason_code).toBe("workboard_start_request_invalid");
+      // unknown field [R21]
+      const unknown = await ctx.store.startCardIfEligible({ ...startRequest(card), extra: true });
+      expect(unknown.reason_code).toBe("workboard_start_request_invalid");
+      // missing field [R22]
+      const partial = startRequest(card) as Record<string, unknown>;
+      delete partial.worker;
+      const missingField = await ctx.store.startCardIfEligible(partial);
+      expect(missingField.reason_code).toBe("workboard_start_request_invalid");
+      // malformed attempt_id (uppercase) [R23]
+      const upper = await ctx.store.startCardIfEligible(
+        startRequest(card, { attempt_id: UUID().toUpperCase() }),
+      );
+      expect(upper.reason_code).toBe("workboard_start_request_invalid");
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R24] a corrupted stored reservation row refuses stored_record_invalid and is never repaired", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "corrupt", status: "ready" });
+      const first = await ctx.store.startCardIfEligible(startRequest(card));
+      expect(first.reason_code).toBe("workboard_start_reserved");
+      const db = new DatabaseSync(ctx.dbPath);
+      // The immutability trigger (F6) refuses this UPDATE, so simulate
+      // out-of-band tampering below the trigger layer: drop, corrupt, and
+      // recreate the trigger byte-exactly (the schema verifier requires it).
+      const triggerDdl = (
+        db
+          .prepare(
+            "SELECT sql FROM sqlite_master WHERE name = 'workboard_card_start_reservations_immutable'",
+          )
+          .get() as { sql: string }
+      ).sql;
+      db.exec("DROP TRIGGER workboard_card_start_reservations_immutable");
+      db.prepare(
+        "UPDATE workboard_card_start_reservations SET authority_id = '' WHERE card_id = ?",
+      ).run(card.id);
+      db.exec(triggerDdl);
+      const corrupted = JSON.stringify(
+        db
+          .prepare("SELECT * FROM workboard_card_start_reservations WHERE card_id = ?")
+          .all(card.id),
+      );
+      db.close();
+      const row = await ctx.store.get(card.id);
+      const response = await ctx.store.startCardIfEligible(
+        startRequest(
+          { id: card.id, status: row?.status ?? "running", updatedAt: row?.updatedAt ?? 0 },
+          {
+            expected_status: row?.status ?? "running",
+          },
+        ),
+      );
+      // The protected/claim ladder may refuse first (card is running+claimed);
+      // force the corrupt read by targeting the reservation directly through a
+      // release, which must also surface stored_record_invalid.
+      const release = await ctx.store.releaseStartReservation({
+        schema_version: 1,
+        reservation_id: first.reservation?.reservation_id,
+        attempt_id: first.reservation?.attempt_id,
+        reason: "probe",
+      });
+      expect([response.reason_code, release.reason_code]).toContain(
+        "workboard_start_stored_record_invalid",
+      );
+      const dbAfter = new DatabaseSync(ctx.dbPath);
+      const after = JSON.stringify(
+        dbAfter
+          .prepare("SELECT * FROM workboard_card_start_reservations WHERE card_id = ?")
+          .all(card.id),
+      );
+      dbAfter.close();
+      expect(after).toBe(corrupted);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R31] neutral release clears the claim, stops the attempt, keeps failureCount, frees the card", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "release", status: "ready" });
+      const reserved = await ctx.store.startCardIfEligible(startRequest(card));
+      const failureBefore = (await ctx.store.get(card.id))?.metadata?.failureCount ?? 0;
+      const release = await ctx.store.releaseStartReservation({
+        schema_version: 1,
+        reservation_id: reserved.reservation?.reservation_id,
+        attempt_id: reserved.reservation?.attempt_id,
+        reason: "canary-neutral-release",
+      });
+      expect(release.reason_code).toBe("workboard_start_released");
+      expect(release.outcome).toBe("released");
+      const after = await ctx.store.get(card.id);
+      expect(after?.status).toBe("ready");
+      expect(after?.metadata?.claim).toBeUndefined();
+      expect(after?.metadata?.failureCount ?? 0).toBe(failureBefore);
+      const attempts = after?.metadata?.attempts ?? [];
+      expect(attempts[0]?.status).toBe("stopped");
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R32][R33] double release is a typed refusal; a released attempt_id is never reused", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "double", status: "ready" });
+      const request = startRequest(card);
+      const reserved = await ctx.store.startCardIfEligible(request);
+      const releaseRequest = {
+        schema_version: 1,
+        reservation_id: reserved.reservation?.reservation_id,
+        attempt_id: reserved.reservation?.attempt_id,
+        reason: "first",
+      };
+      const first = await ctx.store.releaseStartReservation(releaseRequest);
+      expect(first.reason_code).toBe("workboard_start_released");
+      const second = await ctx.store.releaseStartReservation({
+        ...releaseRequest,
+        reason: "second",
+      });
+      expect(second.reason_code).toBe("workboard_start_state_conflict");
+      expect(second.ok).toBe(false);
+      // [R33] reusing the released attempt_id refuses request_invalid.
+      const row = await ctx.store.get(card.id);
+      const reuse = await ctx.store.startCardIfEligible(
+        startRequest(
+          { id: card.id, status: row?.status ?? "ready", updatedAt: row?.updatedAt ?? 0 },
+          { attempt_id: request.attempt_id, expected_assignee: row?.agentId ?? null },
+        ),
+      );
+      expect(reuse.reason_code).toBe("workboard_start_request_invalid");
+      // A NEW attempt_id reserves cleanly after the neutral release.
+      const again = await ctx.store.startCardIfEligible(
+        startRequest(
+          { id: card.id, status: row?.status ?? "ready", updatedAt: row?.updatedAt ?? 0 },
+          { expected_assignee: row?.agentId ?? null },
+        ),
+      );
+      expect(again.reason_code).toBe("workboard_start_reserved");
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R35][R36] receipts refuse UPDATE and DELETE; reserved cards cannot be physically deleted; generic update leaves reservations untouched", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "triggers", status: "ready" });
+      const reserved = await ctx.store.startCardIfEligible(startRequest(card));
+      expect(reserved.reason_code).toBe("workboard_start_reserved");
+      const db = new DatabaseSync(ctx.dbPath);
+      expect(() =>
+        db.prepare("UPDATE workboard_start_receipts SET outcome = 'released'").run(),
+      ).toThrow(/append-only/);
+      expect(() => db.prepare("DELETE FROM workboard_start_receipts").run()).toThrow(/append-only/);
+      expect(() => db.prepare("DELETE FROM workboard_cards WHERE id = ?").run(card.id)).toThrow(
+        /unreleased start reservations/,
+      );
+      // [R35] as specified (F6): a generic UPDATE against reservation identity
+      // columns, an un-release, and an un-bind are all refused BY TRIGGER, and
+      // reservations can never be deleted.
+      for (const sql of [
+        "UPDATE workboard_card_start_reservations SET card_id = attempt_id",
+        "UPDATE workboard_card_start_reservations SET attempt_id = card_id",
+        "UPDATE workboard_card_start_reservations SET authority_id = 'poached'",
+        "UPDATE workboard_card_start_reservations SET reserved_at = 1",
+        "UPDATE workboard_card_start_reservations SET expires_at = 1",
+      ]) {
+        expect(() => db.prepare(sql).run()).toThrow(/immutable/);
+      }
+      expect(() => db.prepare("DELETE FROM workboard_card_start_reservations").run()).toThrow(
+        /never delete/,
+      );
+      const before = JSON.stringify(
+        db
+          .prepare("SELECT * FROM workboard_card_start_reservations WHERE card_id = ?")
+          .all(card.id),
+      );
+      db.close();
+      // A generic metadata/title update cannot touch reservation state.
+      await ctx.store.update(card.id, { title: "renamed while reserved" });
+      const dbAfter = new DatabaseSync(ctx.dbPath);
+      const after = JSON.stringify(
+        dbAfter
+          .prepare("SELECT * FROM workboard_card_start_reservations WHERE card_id = ?")
+          .all(card.id),
+      );
+      dbAfter.close();
+      expect(after).toBe(before);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R37] a direct claim racing the reservation has exactly one winner", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "race claim", status: "ready" });
+      const reserved = await ctx.store.startCardIfEligible(startRequest(card));
+      expect(reserved.reason_code).toBe("workboard_start_reserved");
+      await expect(ctx.store.claim(card.id, { ownerId: "poacher" })).rejects.toThrow(
+        /already claimed/,
+      );
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[F1] the claim token never leaves the server: reserved and already_claimed envelopes are redacted", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "token safety", status: "ready" });
+      const reserved = await ctx.store.startCardIfEligible(startRequest(card));
+      expect(reserved.reason_code).toBe("workboard_start_reserved");
+      expect(reserved.card?.claim?.token).toBe("[redacted]");
+      const liveToken = (await ctx.store.get(card.id))?.metadata?.claim?.token;
+      expect(liveToken).toBeTruthy();
+      expect(liveToken).not.toBe("[redacted]");
+      expect(JSON.stringify(reserved)).not.toContain(liveToken as string);
+      // A different attempt refused on the reserved card must not leak the
+      // live holder's token either.
+      const fresh = await ctx.store.get(card.id);
+      const refused = await ctx.store.startCardIfEligible(
+        startRequest(
+          { id: card.id, status: fresh?.status ?? "running", updatedAt: fresh?.updatedAt ?? 0 },
+          { expected_assignee: fresh?.agentId ?? null },
+        ),
+      );
+      expect(refused.ok).toBe(false);
+      const serialized = JSON.stringify(refused);
+      const realToken = fresh?.metadata?.claim?.token;
+      expect(realToken).toBeTruthy();
+      expect(serialized).not.toContain(realToken as string);
+      if (refused.card?.claim) {
+        expect(refused.card.claim.token).toBe("[redacted]");
+      }
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R25] with schema-4 absent the method refuses migration_required and claim/complete work unchanged", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "legacy surface", status: "ready" });
+      const db = new DatabaseSync(ctx.dbPath);
+      db.exec("DROP TRIGGER workboard_cards_reserved_no_delete");
+      db.exec("DROP TABLE workboard_start_receipts");
+      db.exec("DROP TABLE workboard_card_start_reservations");
+      db.prepare(
+        "DELETE FROM workboard_schema_migrations WHERE id IN ('schema-4','schema-4-ot-gov-4')",
+      ).run();
+      db.close();
+      const response = await ctx.store.startCardIfEligible(startRequest(card));
+      expect(response.reason_code).toBe("workboard_start_migration_required");
+      // Pre-existing surfaces continue to work (§6.15).
+      const claimed = await ctx.store.claim(card.id, { ownerId: "legacy" });
+      expect(claimed.card.status).toBe("running");
+      const completed = await ctx.store.complete(card.id, {
+        ownerId: "legacy",
+        token: claimed.token,
+        summary: "legacy path unaffected by missing schema-4",
+      });
+      expect(completed.status).toBe("done");
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R26] a partially applied schema-4 refuses migration_required and is never repaired in place", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "partial schema", status: "ready" });
+      const db = new DatabaseSync(ctx.dbPath);
+      db.exec("DROP TABLE workboard_start_receipts");
+      db.prepare(
+        "DELETE FROM workboard_schema_migrations WHERE id IN ('schema-4','schema-4-ot-gov-4')",
+      ).run();
+      const master = JSON.stringify(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'workboard_start%' OR name LIKE 'workboard_card_start%' ORDER BY name",
+          )
+          .all(),
+      );
+      db.close();
+      const response = await ctx.store.startCardIfEligible(startRequest(card));
+      expect(response.reason_code).toBe("workboard_start_migration_required");
+      const dbAfter = new DatabaseSync(ctx.dbPath);
+      const masterAfter = JSON.stringify(
+        dbAfter
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'workboard_start%' OR name LIKE 'workboard_card_start%' ORDER BY name",
+          )
+          .all(),
+      );
+      dbAfter.close();
+      expect(masterAfter).toBe(master);
+    } finally {
+      ctx.close();
+    }
+  });
+});

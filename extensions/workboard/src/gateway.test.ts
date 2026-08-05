@@ -742,3 +742,281 @@ describe("workboard atomic gateway methods", () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OT-GOV-4 — start authority gateway boundary (contract v1 §7, rows [R30]
+// [R38][R39] plus registration and envelope round-trips).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("OT-GOV-4 start authority gateway methods", () => {
+  function captureApiWithRuntime(subagentRun: ReturnType<typeof vi.fn>) {
+    const methods = new Map<string, RegisteredGatewayMethod>();
+    const api = {
+      registerGatewayMethod: vi.fn(
+        (
+          method: string,
+          handler: RegisteredGatewayMethod["handler"],
+          opts: RegisteredGatewayMethod["opts"],
+        ) => {
+          methods.set(method, { handler, opts });
+        },
+      ),
+      runtime: {
+        subagent: { run: subagentRun },
+        worktrees: undefined,
+      },
+    } as unknown as OpenClawPluginApi;
+    return { api, methods };
+  }
+
+  function sqliteStore() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wb-start-gw-"));
+    const stores = createWorkboardSqliteStores({ dbPath: path.join(dir, "workboard.sqlite") });
+    const store = new WorkboardStore(stores.cards, {
+      boards: stores.boards,
+      subscriptions: stores.subscriptions,
+      attachments: stores.attachments,
+    });
+    return {
+      store,
+      close() {
+        stores.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  function gatewayStartRequest(
+    card: { id: string; status: string; updatedAt: number },
+    over: Record<string, unknown> = {},
+  ) {
+    return {
+      schema_version: 1,
+      card_id: card.id,
+      attempt_id: crypto.randomUUID().toLowerCase(),
+      authority_id: "veelo-start-authority",
+      expected_status: card.status,
+      expected_updated_at: card.updatedAt,
+      required_dependency_state: "none",
+      forbidden_labels: ["hold", "operator-merge-only", "operator-controlled"],
+      expected_assignee: null,
+      worker: { engine: "codex", mode: "exec", model: null, session_key: null },
+      ...over,
+    };
+  }
+
+  it("registers the three start methods for a sqlite store with write/read scopes; a memory store exposes none", () => {
+    const subagent = vi.fn();
+    const ctx = sqliteStore();
+    try {
+      const withSqlite = captureApiWithRuntime(subagent);
+      registerWorkboardGatewayMethods({ api: withSqlite.api, store: ctx.store });
+      expect(withSqlite.methods.has("workboard.cards.startIfEligible")).toBe(true);
+      expect(withSqlite.methods.has("workboard.cards.releaseStartReservation")).toBe(true);
+      expect(withSqlite.methods.has("workboard.startReceipts.get")).toBe(true);
+      expect(withSqlite.methods.get("workboard.cards.startIfEligible")?.opts).toEqual({
+        scope: "operator.write",
+      });
+      expect(withSqlite.methods.get("workboard.startReceipts.get")?.opts).toEqual({
+        scope: "operator.read",
+      });
+      const withMemory = captureApiWithRuntime(subagent);
+      registerWorkboardGatewayMethods({
+        api: withMemory.api,
+        store: new WorkboardStore(createMemoryStore()),
+      });
+      expect(withMemory.methods.has("workboard.cards.startIfEligible")).toBe(false);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("reserved: creates exactly one worker AFTER commit, binds it, and echoes worker_bound", async () => {
+    const subagent = vi.fn(async () => ({ runId: "run-0001" }));
+    const ctx = sqliteStore();
+    try {
+      const { api, methods } = captureApiWithRuntime(subagent);
+      registerWorkboardGatewayMethods({ api, store: ctx.store });
+      const card = await ctx.store.create({ title: "gateway start", status: "ready" });
+      const response = await invoke(
+        methods,
+        "workboard.cards.startIfEligible",
+        gatewayStartRequest(card),
+      );
+      const envelope = response.payload as {
+        ok: boolean;
+        reason_code: string;
+        reservation: { worker_bound: boolean; reservation_id: string };
+      };
+      expect(envelope.ok).toBe(true);
+      expect(envelope.reason_code).toBe("workboard_start_reserved");
+      expect(envelope.reservation.worker_bound).toBe(true);
+      expect(subagent).toHaveBeenCalledTimes(1);
+      const after = await ctx.store.get(card.id);
+      expect(after?.status).toBe("running");
+      expect(after?.runId).toBe("run-0001");
+      expect(after?.execution).toBeTruthy();
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R30][R38] worker creation failure neutrally releases and returns a retryable failure; refusals never touch the subagent", async () => {
+    const subagent = vi.fn(async () => {
+      throw new Error("engine offline");
+    });
+    const ctx = sqliteStore();
+    try {
+      const { api, methods } = captureApiWithRuntime(subagent);
+      registerWorkboardGatewayMethods({ api, store: ctx.store });
+      const card = await ctx.store.create({ title: "gateway fail", status: "ready" });
+      const response = await invoke(
+        methods,
+        "workboard.cards.startIfEligible",
+        gatewayStartRequest(card),
+      );
+      const envelope = response.payload as {
+        ok: boolean;
+        outcome: string;
+        retryable: boolean;
+        reason_code: string;
+      };
+      expect(envelope.ok).toBe(false);
+      expect(envelope.outcome).toBe("failed");
+      expect(envelope.retryable).toBe(true);
+      expect(subagent).toHaveBeenCalledTimes(1);
+      // Neutral release [R30]: card freed, attempt stopped, failureCount unchanged.
+      const after = await ctx.store.get(card.id);
+      expect(after?.status).toBe("ready");
+      expect(after?.metadata?.claim).toBeUndefined();
+      expect(after?.metadata?.failureCount ?? 0).toBe(0);
+      expect((after?.metadata?.attempts ?? [])[0]?.status).toBe("stopped");
+
+      // [R38] a refused request performs no worker, model, or dispatch call.
+      subagent.mockClear();
+      const held = await ctx.store.create({ title: "held", status: "ready", labels: ["hold"] });
+      const refused = await invoke(
+        methods,
+        "workboard.cards.startIfEligible",
+        gatewayStartRequest(held),
+      );
+      expect((refused.payload as { reason_code: string }).reason_code).toBe(
+        "workboard_start_card_protected",
+      );
+      expect(subagent).not.toHaveBeenCalled();
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[R39] the start surface never reaches dispatch or promote: a held card on the same board stays untouched during a start", async () => {
+    const subagent = vi.fn(async () => ({ runId: "run-0002" }));
+    const ctx = sqliteStore();
+    try {
+      const { api, methods } = captureApiWithRuntime(subagent);
+      registerWorkboardGatewayMethods({ api, store: ctx.store });
+      const held = await ctx.store.create({
+        title: "held bystander",
+        status: "todo",
+        labels: ["hold"],
+      });
+      const card = await ctx.store.create({ title: "start target", status: "ready" });
+      const heldBefore = JSON.stringify(await ctx.store.get(held.id));
+      const response = await invoke(
+        methods,
+        "workboard.cards.startIfEligible",
+        gatewayStartRequest(card),
+      );
+      expect((response.payload as { reason_code: string }).reason_code).toBe(
+        "workboard_start_reserved",
+      );
+      // Exactly one subagent run — the target card. The held bystander is
+      // byte-identical: no promote, no blanket dispatch [R39].
+      expect(subagent).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(await ctx.store.get(held.id))).toBe(heldBefore);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[F3] bookkeeping failure after a live worker binds first and never releases", async () => {
+    const subagent = vi.fn(async () => ({ runId: "run-f3" }));
+    const ctx = sqliteStore();
+    try {
+      const { api, methods } = captureApiWithRuntime(subagent);
+      registerWorkboardGatewayMethods({ api, store: ctx.store });
+      const card = await ctx.store.create({ title: "f3 ordering", status: "ready" });
+      // store.update throws AFTER the worker exists — the old ordering would
+      // neutral-release a live worker's reservation here (the F3 double-start).
+      const updateSpy = vi
+        .spyOn(ctx.store, "update")
+        .mockRejectedValueOnce(new Error("bookkeeping down"));
+      const response = await invoke(
+        methods,
+        "workboard.cards.startIfEligible",
+        gatewayStartRequest(card),
+      );
+      updateSpy.mockRestore();
+      const envelope = response.payload as {
+        ok: boolean;
+        reason_code: string;
+        reservation: { worker_bound: boolean; reservation_id: string; attempt_id: string };
+      };
+      // The worker exists, so the response is the truth: reserved and bound.
+      expect(envelope.ok).toBe(true);
+      expect(envelope.reason_code).toBe("workboard_start_reserved");
+      expect(envelope.reservation.worker_bound).toBe(true);
+      expect(subagent).toHaveBeenCalledTimes(1);
+      // The reservation is bound, NOT released — and a bound reservation
+      // refuses release, so no retry can ever double-start this card.
+      const release = await ctx.store.releaseStartReservation({
+        schema_version: 1,
+        reservation_id: envelope.reservation.reservation_id,
+        attempt_id: envelope.reservation.attempt_id,
+        reason: "should-refuse",
+      });
+      expect(release.reason_code).toBe("workboard_start_state_conflict");
+      const after = await ctx.store.get(card.id);
+      expect(after?.status).toBe("running");
+      expect(after?.metadata?.claim).toBeTruthy();
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("release round-trips through the gateway and the receipt lookup accepts exactly {id}", async () => {
+    const subagent = vi.fn(async () => ({ runId: "run-0003" }));
+    const ctx = sqliteStore();
+    try {
+      const { api, methods } = captureApiWithRuntime(subagent);
+      registerWorkboardGatewayMethods({ api, store: ctx.store });
+      const card = await ctx.store.create({ title: "release via gw", status: "ready" });
+      // Reserve at the STORE level (no worker) so release is neutral.
+      const reserved = await ctx.store.startCardIfEligible(gatewayStartRequest(card));
+      expect(reserved.reason_code).toBe("workboard_start_reserved");
+      const release = await invoke(methods, "workboard.cards.releaseStartReservation", {
+        schema_version: 1,
+        reservation_id: reserved.reservation?.reservation_id,
+        attempt_id: reserved.reservation?.attempt_id,
+        reason: "gateway-release",
+      });
+      expect((release.payload as { reason_code: string }).reason_code).toBe(
+        "workboard_start_released",
+      );
+      // Receipt lookup: closed params.
+      const receipt = await invoke(methods, "workboard.startReceipts.get", {
+        id: reserved.evidence?.ref as string,
+      });
+      expect((receipt.payload as { receipt: { reason_code: string } }).receipt.reason_code).toBe(
+        "workboard_start_reserved",
+      );
+      const badParams = await invoke(methods, "workboard.startReceipts.get", {
+        id: reserved.evidence?.ref as string,
+        extra: 1,
+      });
+      expect(badParams.ok).toBe(false);
+    } finally {
+      ctx.close();
+    }
+  });
+});

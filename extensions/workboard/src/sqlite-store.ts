@@ -12,6 +12,8 @@ import type {
   WorkboardKeyedStore,
 } from "./persistence-types.js";
 import type {
+  StartCardReceiptRow,
+  StartReservationRow,
   WorkboardArtifact,
   WorkboardAttachment,
   WorkboardCard,
@@ -31,9 +33,10 @@ const WORKBOARD_DB_RELATIVE_PATH = ["plugins", "workboard", "workboard.sqlite"] 
 // Schema 3 = additive AUT-WB-ATOMIC correlation authority (contract aut-wb-atomic/1 §6.1).
 // The base DDL below still records `schema-2`; the atomic migration transactionally adds
 // `schema-3` + `schema-3-aut-wb-atomic` so an interrupted migration is all-or-nothing.
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const BASE_SCHEMA_MIGRATION_ID = "schema-2";
-const ATOMIC_SCHEMA_MIGRATION_IDS = [`schema-${SCHEMA_VERSION}`, "schema-3-aut-wb-atomic"] as const;
+const ATOMIC_SCHEMA_MIGRATION_IDS = [`schema-3`, "schema-3-aut-wb-atomic"] as const;
+const START_SCHEMA_MIGRATION_IDS = [`schema-${SCHEMA_VERSION}`, "schema-4-ot-gov-4"] as const;
 const ATOMIC_AUTHORITY_COLUMNS = [
   "correlation_key",
   "governance_spec_version",
@@ -51,6 +54,21 @@ const ATOMIC_RECEIPT_REASON_OUTCOME_PAIRS = [
   ["workboard_stored_record_invalid", "refused"],
   ["workboard_card_state_incompatible", "refused"],
   ["workboard_incompatible_legacy_card", "refused"],
+] as const;
+
+// OT-GOV-4: schema-4 start reservation table (contract §12).
+const START_RESERVATIONS_TABLE = "workboard_card_start_reservations";
+const START_RECEIPTS_TABLE = "workboard_start_receipts";
+const START_RESERVATION_INDEX = "workboard_card_start_reservations_card_unreleased_uq";
+const START_RESERVATION_COMPOUND_INDEX = "workboard_card_start_reservations_card_attempt_uq";
+// Default reservation TTL lives at the store layer (contract §7): the sqlite core
+// receives ttlMs on every request and holds no clock policy of its own.
+
+// OT-GOV-4: start receipt durable reason/outcome pairs (contract §8, append-only).
+const START_RECEIPT_REASON_OUTCOME_PAIRS = [
+  ["workboard_start_reserved", "reserved"],
+  ["workboard_start_recovered", "recovered"],
+  ["workboard_start_released", "released"],
 ] as const;
 const WORKBOARD_SQLITE_BUSY_TIMEOUT_MS = 5000;
 const WORKBOARD_SQLITE_DIR_MODE = 0o700;
@@ -384,6 +402,7 @@ function ensureWorkboardSchema(db: DatabaseSync): void {
     "INSERT OR IGNORE INTO workboard_schema_migrations (id, applied_at) VALUES (?, ?)",
   ).run(BASE_SCHEMA_MIGRATION_ID, Date.now());
   ensureWorkboardAtomicSchema(db);
+  ensureWorkboardStartSchema(db);
 }
 
 // Deterministic kill points required by contract row A34 (migration interruption) and
@@ -594,9 +613,14 @@ type WorkboardAtomicSchemaState = "complete" | "fresh-schema-2" | "refused";
 function workboardAtomicSchemaState(db: DatabaseSync): WorkboardAtomicSchemaState {
   const ledger = allMigrationLedgerIds(db).toSorted();
   const completeLedger = [BASE_SCHEMA_MIGRATION_ID, ...ATOMIC_SCHEMA_MIGRATION_IDS].toSorted();
+  // OT-GOV-4 coexistence: the additive schema-4 rows are KNOWN newer ids, not
+  // tampering. The refusal property is preserved — any ledger row outside the
+  // closed known set still refuses — and the schema-3 objects themselves are
+  // untouched (OT-GOV-4 contract §2: no change to AUT-WB-ATOMIC).
+  const knownNewerIds = new Set<string>(START_SCHEMA_MIGRATION_IDS);
   const ledgerIsComplete =
-    ledger.length === completeLedger.length &&
-    completeLedger.every((id, index) => ledger[index] === id);
+    completeLedger.every((id) => ledger.includes(id)) &&
+    ledger.every((id) => completeLedger.includes(id) || knownNewerIds.has(id));
   const ledgerIsFresh = ledger.length === 1 && ledger[0] === BASE_SCHEMA_MIGRATION_ID;
   const columnRows = db.prepare("PRAGMA table_info(workboard_cards)").all() as Row[];
   const columnTypes = new Map(
@@ -730,6 +754,241 @@ function ensureWorkboardAtomicSchema(db: DatabaseSync): boolean {
     return false;
   }
   return workboardAtomicSchemaComplete(db);
+}
+
+// ============================================================
+// OT-GOV-4: Schema-4 migration (contract §12)
+// ============================================================
+
+// Exact schema-4 object DDL for the start reservation table.
+function startReceiptsTableDdl(): string {
+  const durableReasons = START_RECEIPT_REASON_OUTCOME_PAIRS.map(([reason]) => `'${reason}'`).join(
+    ", ",
+  );
+  const reasonOutcomePairs = START_RECEIPT_REASON_OUTCOME_PAIRS.map(
+    ([reason, outcome]) => `(reason_code = '${reason}' AND outcome = '${outcome}')`,
+  ).join("\n    OR ");
+  return `CREATE TABLE workboard_start_receipts (
+  id TEXT PRIMARY KEY CHECK (id GLOB '${ATOMIC_UUID_GLOB}'),
+  reservation_id TEXT NOT NULL CHECK (reservation_id GLOB '${ATOMIC_UUID_GLOB}'),
+  attempt_id TEXT NOT NULL CHECK (attempt_id GLOB '${ATOMIC_UUID_GLOB}'),
+  card_id TEXT NOT NULL CHECK (card_id GLOB '${ATOMIC_UUID_GLOB}'),
+  outcome TEXT NOT NULL,
+  reason_code TEXT NOT NULL CHECK (reason_code IN (${durableReasons})),
+  created_at INTEGER NOT NULL CHECK (created_at > 0),
+  CHECK (
+    ${reasonOutcomePairs}
+  )
+)`;
+}
+
+type WorkboardStartSchemaObject = {
+  type: "table" | "index" | "trigger";
+  name: string;
+  ddl: string;
+};
+
+function startSchemaObjects(): WorkboardStartSchemaObject[] {
+  return [
+    {
+      type: "table",
+      name: START_RESERVATIONS_TABLE,
+      ddl: `CREATE TABLE workboard_card_start_reservations (
+  reservation_id TEXT PRIMARY KEY CHECK (reservation_id GLOB '${ATOMIC_UUID_GLOB}'),
+  card_id TEXT NOT NULL REFERENCES workboard_cards(id),
+  attempt_id TEXT NOT NULL CHECK (attempt_id GLOB '${ATOMIC_UUID_GLOB}'),
+  authority_id TEXT NOT NULL,
+  reserved_at INTEGER NOT NULL CHECK (reserved_at > 0),
+  expires_at INTEGER NOT NULL CHECK (expires_at > 0),
+  worker_bound INTEGER NOT NULL DEFAULT 0,
+  released_at INTEGER,
+  release_reason TEXT
+)`,
+    },
+    {
+      type: "index",
+      name: START_RESERVATION_COMPOUND_INDEX,
+      ddl: `CREATE UNIQUE INDEX workboard_card_start_reservations_card_attempt_uq
+ON workboard_card_start_reservations(card_id, attempt_id)`,
+    },
+    {
+      type: "index",
+      name: START_RESERVATION_INDEX,
+      ddl: `CREATE UNIQUE INDEX workboard_card_start_reservations_card_unreleased_uq
+ON workboard_card_start_reservations(card_id)
+WHERE released_at IS NULL`,
+    },
+    {
+      type: "table",
+      name: START_RECEIPTS_TABLE,
+      ddl: startReceiptsTableDdl(),
+    },
+    {
+      type: "trigger",
+      name: "workboard_start_receipts_no_update",
+      ddl: `CREATE TRIGGER workboard_start_receipts_no_update
+BEFORE UPDATE ON workboard_start_receipts
+BEGIN SELECT RAISE(ABORT, 'workboard start receipts are append-only'); END`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_start_receipts_no_delete",
+      ddl: `CREATE TRIGGER workboard_start_receipts_no_delete
+BEFORE DELETE ON workboard_start_receipts
+BEGIN SELECT RAISE(ABORT, 'workboard start receipts are append-only'); END`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_card_start_reservations_immutable",
+      ddl: `CREATE TRIGGER workboard_card_start_reservations_immutable
+BEFORE UPDATE ON workboard_card_start_reservations
+WHEN NEW.reservation_id != OLD.reservation_id
+  OR NEW.card_id != OLD.card_id
+  OR NEW.attempt_id != OLD.attempt_id
+  OR NEW.authority_id != OLD.authority_id
+  OR NEW.reserved_at != OLD.reserved_at
+  OR NEW.expires_at != OLD.expires_at
+  OR (OLD.released_at IS NOT NULL AND NEW.released_at IS NULL)
+  OR (OLD.released_at IS NOT NULL AND NEW.released_at != OLD.released_at)
+  OR (OLD.worker_bound = 1 AND NEW.worker_bound = 0)
+BEGIN
+  SELECT RAISE(ABORT, 'start reservation identity and release state are immutable');
+END`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_card_start_reservations_no_delete",
+      ddl: `CREATE TRIGGER workboard_card_start_reservations_no_delete
+BEFORE DELETE ON workboard_card_start_reservations
+BEGIN
+  SELECT RAISE(ABORT, 'start reservations are immutable history; release, never delete');
+END`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_cards_reserved_no_delete",
+      ddl: `CREATE TRIGGER workboard_cards_reserved_no_delete
+BEFORE DELETE ON workboard_cards
+WHEN (SELECT COUNT(*) FROM workboard_card_start_reservations
+      WHERE card_id = OLD.id AND released_at IS NULL) > 0
+BEGIN
+  SELECT RAISE(ABORT, 'cards with unreleased start reservations cannot be physically deleted');
+END`,
+    },
+  ];
+}
+
+type WorkboardStartSchemaState = "complete" | "schema-3-ok" | "refused";
+
+// Verify schema-4 completeness (contract §12). Like schema-3, complete means:
+// migration ledger includes both schema-4 and schema-4-ot-gov-4, all schema-4
+// objects exist in sqlite_master with exact DDL, and the partial unique index
+// is present as the exclusion point.
+function workboardStartSchemaState(db: DatabaseSync): WorkboardStartSchemaState {
+  const ledgerSet = new Set(allMigrationLedgerIds(db));
+  const requiredStartIds = [
+    BASE_SCHEMA_MIGRATION_ID,
+    ...ATOMIC_SCHEMA_MIGRATION_IDS,
+    ...START_SCHEMA_MIGRATION_IDS,
+  ];
+  const ledgerHasStart = requiredStartIds.every((id) => ledgerSet.has(id));
+  if (!ledgerHasStart) {
+    // Check if schema-3 is complete (prerequisite)
+    const ledgerIsComplete3 = [BASE_SCHEMA_MIGRATION_ID, ...ATOMIC_SCHEMA_MIGRATION_IDS].every(
+      (id) => ledgerSet.has(id),
+    );
+    if (ledgerIsComplete3) {
+      // Schema-3 complete but schema-4 not yet applied — check for partial application
+      const objectNames = new Set(startSchemaObjects().map((obj) => obj.name));
+      const masterSql = new Map(
+        (db.prepare("SELECT type, name, sql FROM sqlite_master").all() as Row[]).flatMap((row) =>
+          typeof row.name === "string" && objectNames.has(row.name)
+            ? [[row.name, String(row.sql)]]
+            : [],
+        ),
+      );
+      if (masterSql.size > 0) {
+        // Partial schema-4 objects present — refused (contract §12: never repaired in place)
+        return "refused";
+      }
+      return "schema-3-ok";
+    }
+    return "refused";
+  }
+  // Verify all schema-4 objects exist with exact DDL
+  const objectNames = new Set(startSchemaObjects().map((obj) => obj.name));
+  const masterSql = new Map(
+    (db.prepare("SELECT type, name, sql FROM sqlite_master").all() as Row[]).flatMap((row) =>
+      typeof row.name === "string" && objectNames.has(row.name)
+        ? [[row.name, { type: String(row.type), sql: typeof row.sql === "string" ? row.sql : "" }]]
+        : [],
+    ),
+  );
+  const objectsExact = startSchemaObjects().every((obj) => {
+    const stored = masterSql.get(obj.name);
+    return (
+      stored !== undefined &&
+      stored.type === obj.type &&
+      normalizeDdl(stored.sql) === normalizeDdl(obj.ddl)
+    );
+  });
+  return objectsExact ? "complete" : "refused";
+}
+
+export function workboardStartSchemaComplete(db: DatabaseSync): boolean {
+  return workboardStartSchemaState(db) === "complete";
+}
+
+// Contract §12: one transaction covering DDL for reservation table, indexes,
+// receipts table, triggers, and ledger entries. Returns true when schema-4 is
+// complete afterwards. Never throws for migration failure.
+function ensureWorkboardStartSchema(db: DatabaseSync): boolean {
+  const state = workboardStartSchemaState(db);
+  if (state === "complete") {
+    return true;
+  }
+  if (state !== "schema-3-ok") {
+    return false;
+  }
+  try {
+    db.exec("BEGIN IMMEDIATE");
+  } catch {
+    return false;
+  }
+  try {
+    // Create tables and triggers (non-index objects first)
+    for (const obj of startSchemaObjects()) {
+      if (obj.type !== "index") {
+        db.exec(obj.ddl);
+      }
+    }
+    atomicTestCrashPoint("start-migration-ddl");
+    // Create indexes last (they validate against existing data)
+    for (const obj of startSchemaObjects()) {
+      if (obj.type === "index") {
+        db.exec(obj.ddl);
+      }
+    }
+    atomicTestCrashPoint("start-migration-index");
+    // Record migration
+    const insertLedger = db.prepare(
+      "INSERT INTO workboard_schema_migrations (id, applied_at) VALUES (?, ?)",
+    );
+    for (const id of START_SCHEMA_MIGRATION_IDS) {
+      insertLedger.run(id, Date.now());
+    }
+    atomicTestCrashPoint("start-migration-ledger");
+    db.exec("COMMIT");
+    atomicTestCrashPoint("start-migration-post-commit");
+  } catch {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      return false;
+    }
+    return false;
+  }
+  return workboardStartSchemaComplete(db);
 }
 
 function chmodIfExists(targetPath: string, mode: number): void {
@@ -1536,6 +1795,118 @@ export type WorkboardAtomicReceiptRow = {
 // Capability surface the store layer detects before treating an injected keyed store
 // as the SQLite atomic authority. Memory/test stores lack it and the boundary then
 // refuses with workboard_unavailable instead of falling back (contract invariant 15).
+
+// ── OT-GOV-4 support (contract v1) ──────────────────────────────────────────
+
+// Next ordinal for an append into a per-card child table.
+function nextChildOrdinal(db: DatabaseSync, table: string, cardId: string): number {
+  const row = db
+    .prepare(`SELECT COALESCE(MAX(ordinal), -1) + 1 AS next FROM ${table} WHERE card_id = ?`)
+    .get(cardId) as Row;
+  return Number(row.next);
+}
+
+// Strict hydration of a reservation row. Throws on any malformed field so a
+// corrupted stored record refuses (§11 row 24) instead of being repaired.
+function mapStartReservation(row: Row): StartReservationRow {
+  const releasedAt = row.released_at;
+  const releaseReason = row.release_reason;
+  return {
+    reservationId: requiredString(row, "reservation_id"),
+    cardId: requiredString(row, "card_id"),
+    attemptId: requiredString(row, "attempt_id"),
+    authorityId: requiredString(row, "authority_id"),
+    reservedAt: requiredNumber(row, "reserved_at"),
+    expiresAt: requiredNumber(row, "expires_at"),
+    workerBound: requiredNumber(row, "worker_bound") === 1,
+    releasedAt: releasedAt === null || releasedAt === undefined ? null : Number(releasedAt),
+    releaseReason:
+      typeof releaseReason === "string" && releaseReason.length > 0 ? releaseReason : null,
+  };
+}
+
+// The partial unique index reports its violation by name.
+function isStartReservationUniqueViolation(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("UNIQUE constraint failed") &&
+    error.message.includes("workboard_card_start_reservations")
+  );
+}
+
+// Store-layer request for the transactional core. All grammar/closed-set
+// validation is complete before construction (§6.4): ids are exact lowercase
+// UUIDs, forbiddenLabels includes the mandatory set, worker is the closed spec.
+export type WorkboardStartStoreRequest = {
+  cardId: string;
+  attemptId: string;
+  authorityId: string;
+  expectedStatus: string;
+  expectedUpdatedAt: number;
+  requiredDependencyState: "all_parents_done" | "none";
+  forbiddenLabels: string[];
+  expectedAssignee: string | null;
+  reservationId: string;
+  receiptId: string;
+  eventId: string;
+  claimToken: string;
+  worker: { engine: string; mode: string; model: string | null; sessionKey: string | null };
+  now: number;
+  ttlMs: number;
+};
+
+export type WorkboardStartRefusalReason =
+  | "workboard_start_request_invalid"
+  | "workboard_start_card_not_found"
+  | "workboard_start_card_protected"
+  | "workboard_start_dependencies_unsatisfied"
+  | "workboard_start_state_conflict"
+  | "workboard_start_already_claimed"
+  | "workboard_start_active_execution"
+  | "workboard_start_already_reserved"
+  | "workboard_start_retry_budget_exhausted"
+  | "workboard_start_stored_record_invalid";
+
+export type WorkboardStartStoreResult =
+  | { kind: "migration_required" }
+  | { kind: "unavailable" }
+  | { kind: "storage_failure" }
+  | { kind: "uncertain" }
+  | { kind: "refused"; reasonCode: WorkboardStartRefusalReason; card: WorkboardCard | null }
+  | {
+      kind: "reserved" | "recovered";
+      reservation: StartReservationRow;
+      card: WorkboardCard;
+      receiptId: string;
+    };
+
+export type WorkboardStartReleaseStoreRequest = {
+  reservationId: string;
+  attemptId: string;
+  reason: string;
+  receiptId: string;
+  eventId: string;
+  now: number;
+};
+
+export type WorkboardStartReleaseStoreResult =
+  | { kind: "migration_required" }
+  | { kind: "unavailable" }
+  | { kind: "storage_failure" }
+  | { kind: "uncertain" }
+  | { kind: "refused"; reasonCode: WorkboardStartRefusalReason }
+  | { kind: "released"; reservation: StartReservationRow; receiptId: string };
+
+export type WorkboardStartCapableCardStore = {
+  startCardIfEligible(request: WorkboardStartStoreRequest): WorkboardStartStoreResult;
+  releaseStartReservation(
+    request: WorkboardStartReleaseStoreRequest,
+  ): WorkboardStartReleaseStoreResult;
+  bindStartReservationWorker(reservationId: string): boolean;
+  getStartReceipt(id: string): StartCardReceiptRow | null;
+  verifyStartMigrationComplete(): boolean;
+};
+
 export type WorkboardAtomicCapableCardStore = {
   atomicCreateOrRecover(
     request: WorkboardAtomicCreateStoreRequest,
@@ -1566,7 +1937,9 @@ function isCorrelationUniqueViolation(error: unknown): boolean {
   );
 }
 
-class WorkboardSqliteCardStore implements WorkboardKeyedStore, WorkboardAtomicCapableCardStore {
+class WorkboardSqliteCardStore
+  implements WorkboardKeyedStore, WorkboardAtomicCapableCardStore, WorkboardStartCapableCardStore
+{
   constructor(private readonly db: DatabaseSync) {}
 
   verifyAtomicMigrationComplete(): boolean {
@@ -1993,6 +2366,449 @@ class WorkboardSqliteCardStore implements WorkboardKeyedStore, WorkboardAtomicCa
       key: requiredString(row, "id"),
       value: { version: 1, card: readCard(this.db, row) },
     }));
+  }
+
+  // ============== OT-GOV-4: Start authority (contract v1 §3–§6) ==============
+  //
+  // One serialized BEGIN IMMEDIATE transaction re-reads live card state, applies
+  // the refusal ladder (§6.5: protected outranks everything except request
+  // validity, which the store layer completes before calling here), and only on
+  // a fully validated, fully eligible request mutates: one reservation row, one
+  // attempt row in status "reserved", the card transition to "running" with the
+  // reserving claim, one card event, one append-only start receipt (§4). Every
+  // refusal is a PURE READ (§5) — unlike the atomic-create precedent above, no
+  // receipt is written on refusal; the partial unique index
+  // workboard_card_start_reservations_card_unreleased_uq is the exclusion
+  // point, and CAS is a staleness check only (§3).
+
+  verifyStartMigrationComplete(): boolean {
+    try {
+      return workboardStartSchemaComplete(this.db);
+    } catch {
+      return false;
+    }
+  }
+
+  startCardIfEligible(request: WorkboardStartStoreRequest): WorkboardStartStoreResult {
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+    } catch {
+      return { kind: "unavailable" };
+    }
+    let phase: "work" | "commit" = "work";
+    try {
+      if (!workboardStartSchemaComplete(this.db)) {
+        this.db.exec("ROLLBACK");
+        return { kind: "migration_required" };
+      }
+      const row = this.db
+        .prepare("SELECT * FROM workboard_cards WHERE id = ?")
+        .get(request.cardId) as Row | undefined;
+      if (!row) {
+        this.db.exec("ROLLBACK");
+        return { kind: "refused", reasonCode: "workboard_start_card_not_found", card: null };
+      }
+      const card = readCard(this.db, row);
+      const refuse = (reasonCode: WorkboardStartRefusalReason): WorkboardStartStoreResult => {
+        this.db.exec("ROLLBACK");
+        return { kind: "refused", reasonCode, card };
+      };
+
+      // §6.5 — operator protection outranks every other check.
+      const forbidden = new Set(request.forbiddenLabels);
+      if (card.labels.some((label) => forbidden.has(label)) || card.status === "review") {
+        return refuse("workboard_start_card_protected");
+      }
+      // §6.2 — attempt-level idempotency precedes the staleness checks: a
+      // replay of the same (card_id, attempt_id) after a lost response must
+      // recover even though the committed reservation itself changed the
+      // card's status, claim, and updated_at. Only operator protection
+      // outranks recovery.
+      let replay: StartReservationRow | null = null;
+      try {
+        const replayRow = this.db
+          .prepare(`SELECT * FROM ${START_RESERVATIONS_TABLE} WHERE card_id = ? AND attempt_id = ?`)
+          .get(request.cardId, request.attemptId) as Row | undefined;
+        replay = replayRow ? mapStartReservation(replayRow) : null;
+      } catch {
+        return refuse("workboard_start_stored_record_invalid");
+      }
+      if (replay && replay.releasedAt !== null) {
+        // §11 row 33 — a released attempt_id is never reused.
+        return refuse("workboard_start_request_invalid");
+      }
+      if (replay) {
+        // F4 (Round 1) — §6.2: a replay CREATES NOTHING. The evidence is the
+        // ORIGINAL reserved receipt, read inside the same transaction; a
+        // reservation without its reserved receipt is a corrupted record.
+        const originalReceipt = this.db
+          .prepare(
+            `SELECT id FROM ${START_RECEIPTS_TABLE}
+             WHERE reservation_id = ? AND reason_code = 'workboard_start_reserved'`,
+          )
+          .get(replay.reservationId) as Row | undefined;
+        if (!originalReceipt) {
+          return refuse("workboard_start_stored_record_invalid");
+        }
+        this.db.exec("ROLLBACK");
+        return {
+          kind: "recovered",
+          reservation: replay,
+          card,
+          receiptId: requiredString(originalReceipt, "id"),
+        };
+      }
+      // F5 (Round 1) — §11 row 4: the unreleased-reservation refusal must
+      // outrank CAS, because a committed reservation always changes exactly
+      // the state CAS inspects; concurrent losers owe `already_reserved`,
+      // never `state_conflict`. (Row 24: a corrupted stored row refuses and
+      // is never repaired.)
+      let activeEarly: StartReservationRow | null = null;
+      try {
+        const activeRow = this.db
+          .prepare(
+            `SELECT * FROM ${START_RESERVATIONS_TABLE} WHERE card_id = ? AND released_at IS NULL`,
+          )
+          .get(request.cardId) as Row | undefined;
+        activeEarly = activeRow ? mapStartReservation(activeRow) : null;
+      } catch {
+        return refuse("workboard_start_stored_record_invalid");
+      }
+      if (activeEarly) {
+        return refuse("workboard_start_already_reserved");
+      }
+      // §6.6 — CAS staleness checks refuse without mutation.
+      if (card.status !== request.expectedStatus || card.updatedAt !== request.expectedUpdatedAt) {
+        return refuse("workboard_start_state_conflict");
+      }
+      if (request.expectedAssignee !== (card.agentId ?? null)) {
+        return refuse("workboard_start_state_conflict");
+      }
+      // §6.7 — a live claim or an active execution refuses without mutation.
+      const claim = card.metadata?.claim;
+      if (claim && typeof claim.expiresAt === "number" && claim.expiresAt > request.now) {
+        return refuse("workboard_start_already_claimed");
+      }
+      if (card.status === "running" || card.execution?.status === "running") {
+        return refuse("workboard_start_active_execution");
+      }
+      // Dependencies (§5): parents must be done when the request demands it.
+      if (request.requiredDependencyState === "all_parents_done") {
+        const parentIds = (card.metadata?.links ?? [])
+          .filter((link) => link.type === "parent" && link.targetCardId)
+          .map((link) => link.targetCardId as string);
+        for (const parentId of parentIds) {
+          const parent = this.db
+            .prepare("SELECT status FROM workboard_cards WHERE id = ?")
+            .get(parentId) as Row | undefined;
+          if (!parent || parent.status !== "done") {
+            return refuse("workboard_start_dependencies_unsatisfied");
+          }
+        }
+      }
+      // Retry budget (§8): mirrors store.ts retryBudgetExhausted.
+      const maxRetries = card.metadata?.automation?.maxRetries;
+      if (maxRetries && (card.metadata?.failureCount ?? 0) > maxRetries) {
+        return refuse("workboard_start_retry_budget_exhausted");
+      }
+
+      // Fully eligible — the §4 permitted effects, all in this transaction.
+      this.db
+        .prepare(
+          `INSERT INTO ${START_RESERVATIONS_TABLE}
+             (reservation_id, card_id, attempt_id, authority_id, reserved_at, expires_at, worker_bound)
+           VALUES (?, ?, ?, ?, ?, ?, 0)`,
+        )
+        .run(
+          request.reservationId,
+          request.cardId,
+          request.attemptId,
+          request.authorityId,
+          request.now,
+          request.now + request.ttlMs,
+        );
+      const attemptOrdinal = nextChildOrdinal(this.db, "workboard_card_attempts", request.cardId);
+      this.db
+        .prepare(
+          `INSERT INTO workboard_card_attempts
+             (id, card_id, ordinal, status, started_at, engine, mode, model, session_key)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          request.attemptId,
+          request.cardId,
+          attemptOrdinal,
+          "reserved",
+          request.now,
+          request.worker.engine,
+          request.worker.mode,
+          request.worker.model,
+          request.worker.sessionKey,
+        );
+      const claimJson = JSON.stringify({
+        ownerId: request.authorityId,
+        token: request.claimToken,
+        claimedAt: request.now,
+        lastHeartbeatAt: request.now,
+        expiresAt: request.now + request.ttlMs,
+      });
+      this.db
+        .prepare(
+          `UPDATE workboard_cards
+             SET status = 'running',
+                 claim_json = ?,
+                 agent_id = COALESCE(agent_id, ?),
+                 updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(claimJson, request.authorityId, request.now, request.cardId);
+      const eventOrdinal = nextChildOrdinal(this.db, "workboard_card_events", request.cardId);
+      this.db
+        .prepare(
+          `INSERT INTO workboard_card_events
+             (id, card_id, ordinal, kind, at, from_status, to_status)
+           VALUES (?, ?, ?, 'start_reserved', ?, ?, 'running')`,
+        )
+        .run(request.eventId, request.cardId, eventOrdinal, request.now, card.status);
+      this.insertStartReceipt({
+        id: request.receiptId,
+        reservationId: request.reservationId,
+        attemptId: request.attemptId,
+        cardId: request.cardId,
+        outcome: "reserved",
+        reasonCode: "workboard_start_reserved",
+        createdAt: request.now,
+      });
+      atomicTestCrashPoint("start-before-commit");
+      phase = "commit";
+      this.db.exec("COMMIT");
+      atomicTestCrashPoint("start-after-commit");
+      const reservationRow = this.db
+        .prepare(`SELECT * FROM ${START_RESERVATIONS_TABLE} WHERE reservation_id = ?`)
+        .get(request.reservationId) as Row;
+      const committedRow = this.db
+        .prepare("SELECT * FROM workboard_cards WHERE id = ?")
+        .get(request.cardId) as Row;
+      return {
+        kind: "reserved",
+        reservation: mapStartReservation(reservationRow),
+        card: readCard(this.db, committedRow),
+        receiptId: request.receiptId,
+      };
+    } catch (error) {
+      let rolledBack = false;
+      try {
+        this.db.exec("ROLLBACK");
+        rolledBack = true;
+      } catch {
+        // rollback failed; commit state unknowable
+      }
+      if (phase === "commit" || !rolledBack) {
+        return { kind: "uncertain" };
+      }
+      if (isStartReservationUniqueViolation(error)) {
+        // The partial unique index arbitrated a race this transaction lost.
+        return { kind: "refused", reasonCode: "workboard_start_already_reserved", card: null };
+      }
+      return { kind: "storage_failure" };
+    }
+  }
+
+  // §10 — neutral release: claim cleared, attempt closed as "stopped",
+  // failureCount untouched, reservation marked released. Never a second start.
+  releaseStartReservation(
+    request: WorkboardStartReleaseStoreRequest,
+  ): WorkboardStartReleaseStoreResult {
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+    } catch {
+      return { kind: "unavailable" };
+    }
+    let phase: "work" | "commit" = "work";
+    try {
+      if (!workboardStartSchemaComplete(this.db)) {
+        this.db.exec("ROLLBACK");
+        return { kind: "migration_required" };
+      }
+      const refuse = (
+        reasonCode: WorkboardStartRefusalReason,
+      ): WorkboardStartReleaseStoreResult => {
+        this.db.exec("ROLLBACK");
+        return { kind: "refused", reasonCode };
+      };
+      const row = this.db
+        .prepare(`SELECT * FROM ${START_RESERVATIONS_TABLE} WHERE reservation_id = ?`)
+        .get(request.reservationId) as Row | undefined;
+      if (!row) {
+        return refuse("workboard_start_request_invalid");
+      }
+      let reservation: StartReservationRow;
+      try {
+        reservation = mapStartReservation(row);
+      } catch {
+        return refuse("workboard_start_stored_record_invalid");
+      }
+      if (reservation.attemptId !== request.attemptId) {
+        return refuse("workboard_start_request_invalid");
+      }
+      if (reservation.releasedAt !== null) {
+        // §11 row 32 — releasing twice is a typed refusal with no second effect.
+        return refuse("workboard_start_state_conflict");
+      }
+      if (reservation.workerBound) {
+        // A bound worker is live work; releasing it is not neutral.
+        return refuse("workboard_start_state_conflict");
+      }
+      this.db
+        .prepare(
+          `UPDATE ${START_RESERVATIONS_TABLE}
+             SET released_at = ?, release_reason = ?
+           WHERE reservation_id = ?`,
+        )
+        .run(request.now, request.reason, request.reservationId);
+      this.db
+        .prepare(
+          `UPDATE workboard_card_attempts
+             SET status = 'stopped', ended_at = ?
+           WHERE id = ? AND card_id = ?`,
+        )
+        .run(request.now, reservation.attemptId, reservation.cardId);
+      // F11 (Round 1): clear ONLY the reservation's own claim. After the
+      // reservation TTL lapses a legacy claim() by another owner can succeed;
+      // a late neutral release must not destroy that foreign claim.
+      const cardRow = this.db
+        .prepare("SELECT status, claim_json FROM workboard_cards WHERE id = ?")
+        .get(reservation.cardId) as Row | undefined;
+      const fromStatus = cardRow ? String(cardRow.status) : null;
+      let ownClaim = false;
+      if (cardRow && typeof cardRow.claim_json === "string") {
+        try {
+          const storedClaim = JSON.parse(cardRow.claim_json) as {
+            ownerId?: unknown;
+            claimedAt?: unknown;
+          };
+          ownClaim =
+            storedClaim.ownerId === reservation.authorityId &&
+            storedClaim.claimedAt === reservation.reservedAt;
+        } catch {
+          ownClaim = false;
+        }
+      }
+      const toStatus = ownClaim && fromStatus === "running" ? "ready" : fromStatus;
+      if (ownClaim) {
+        this.db
+          .prepare(
+            `UPDATE workboard_cards
+               SET claim_json = NULL,
+                   status = CASE WHEN status = 'running' THEN 'ready' ELSE status END,
+                   updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(request.now, reservation.cardId);
+      } else {
+        this.db
+          .prepare("UPDATE workboard_cards SET updated_at = ? WHERE id = ?")
+          .run(request.now, reservation.cardId);
+      }
+      // F10 (Round 1): the event records the transition that actually
+      // happened, never a hardcoded one.
+      const eventOrdinal = nextChildOrdinal(this.db, "workboard_card_events", reservation.cardId);
+      this.db
+        .prepare(
+          `INSERT INTO workboard_card_events
+             (id, card_id, ordinal, kind, at, from_status, to_status)
+           VALUES (?, ?, ?, 'start_released', ?, ?, ?)`,
+        )
+        .run(request.eventId, reservation.cardId, eventOrdinal, request.now, fromStatus, toStatus);
+      this.insertStartReceipt({
+        id: request.receiptId,
+        reservationId: reservation.reservationId,
+        attemptId: reservation.attemptId,
+        cardId: reservation.cardId,
+        outcome: "released",
+        reasonCode: "workboard_start_released",
+        createdAt: request.now,
+      });
+      atomicTestCrashPoint("release-before-commit");
+      phase = "commit";
+      this.db.exec("COMMIT");
+      atomicTestCrashPoint("release-after-commit");
+      const releasedRow = this.db
+        .prepare(`SELECT * FROM ${START_RESERVATIONS_TABLE} WHERE reservation_id = ?`)
+        .get(request.reservationId) as Row;
+      return {
+        kind: "released",
+        reservation: mapStartReservation(releasedRow),
+        receiptId: request.receiptId,
+      };
+    } catch {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        return { kind: "uncertain" };
+      }
+      return phase === "commit" ? { kind: "uncertain" } : { kind: "storage_failure" };
+    }
+  }
+
+  // Worker binding happens AFTER the reservation commit (§4): the gateway
+  // handler created a worker and records that exactly once. Not part of the
+  // atomic guarantee — a crash before this leaves an orphan for neutral release.
+  bindStartReservationWorker(reservationId: string): boolean {
+    const result = runTransaction(this.db, () =>
+      this.db
+        .prepare(
+          `UPDATE ${START_RESERVATIONS_TABLE}
+             SET worker_bound = 1
+           WHERE reservation_id = ? AND released_at IS NULL AND worker_bound = 0`,
+        )
+        .run(reservationId),
+    );
+    return result.changes > 0;
+  }
+
+  getStartReceipt(id: string): StartCardReceiptRow | null {
+    const row = this.db.prepare(`SELECT * FROM ${START_RECEIPTS_TABLE} WHERE id = ?`).get(id) as
+      | Row
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      id: requiredString(row, "id"),
+      reservationId: requiredString(row, "reservation_id"),
+      attemptId: requiredString(row, "attempt_id"),
+      cardId: requiredString(row, "card_id"),
+      outcome: requiredString(row, "outcome"),
+      reasonCode: requiredString(row, "reason_code"),
+      createdAt: requiredNumber(row, "created_at"),
+    };
+  }
+
+  private insertStartReceipt(receipt: {
+    id: string;
+    reservationId: string;
+    attemptId: string;
+    cardId: string;
+    outcome: string;
+    reasonCode: string;
+    createdAt: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO ${START_RECEIPTS_TABLE}
+           (id, reservation_id, attempt_id, card_id, outcome, reason_code, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        receipt.id,
+        receipt.reservationId,
+        receipt.attemptId,
+        receipt.cardId,
+        receipt.outcome,
+        receipt.reasonCode,
+        receipt.createdAt,
+      );
   }
 }
 

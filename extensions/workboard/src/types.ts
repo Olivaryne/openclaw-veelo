@@ -52,6 +52,7 @@ export const WORKBOARD_ATTEMPT_STATUSES = [
   "succeeded",
   "failed",
   "blocked",
+  "reserved",
   "stopped",
 ] as const;
 export const WORKBOARD_LINK_TYPES = [
@@ -480,4 +481,177 @@ export type AtomicCreateReceiptV1 = {
 export type AtomicCreateReceiptLookupResponseV1 = {
   schema_version: 1;
   receipt: AtomicCreateReceiptV1 | null;
+};
+
+// OT-GOV-4 — frozen implementation contract (v1): atomic per-card worker-start authority.
+// The reason-code set, envelope field set, and ok/outcome/retryable combinations are
+// frozen by that contract; changing any of them requires a contract-version reset.
+// Precedent: AUT-WB-ATOMIC (WORKBOARD_ATOMIC_* constants above).
+
+export const WORKBOARD_START_REASON_CODES = [
+  "workboard_start_reserved",
+  "workboard_start_recovered",
+  "workboard_start_released",
+  "workboard_start_request_invalid",
+  "workboard_start_card_not_found",
+  "workboard_start_card_protected",
+  "workboard_start_dependencies_unsatisfied",
+  "workboard_start_state_conflict",
+  "workboard_start_already_claimed",
+  "workboard_start_active_execution",
+  "workboard_start_already_reserved",
+  "workboard_start_retry_budget_exhausted",
+  "workboard_start_stored_record_invalid",
+  "workboard_start_migration_required",
+  "workboard_unavailable",
+  "workboard_storage_failure",
+  "workboard_result_uncertain",
+] as const;
+
+export const WORKBOARD_START_OUTCOMES = [
+  "reserved",
+  "recovered",
+  "released",
+  "refused",
+  "failed",
+] as const;
+
+export type WorkboardStartReasonCode = (typeof WORKBOARD_START_REASON_CODES)[number];
+export type WorkboardStartOutcome = (typeof WORKBOARD_START_OUTCOMES)[number];
+
+export const WORKBOARD_START_REASON_TABLE: Record<
+  WorkboardStartReasonCode,
+  { ok: boolean; outcome: WorkboardStartOutcome; retryable: boolean }
+> = {
+  workboard_start_reserved: { ok: true, outcome: "reserved", retryable: false },
+  workboard_start_recovered: { ok: true, outcome: "recovered", retryable: false },
+  workboard_start_released: { ok: true, outcome: "released", retryable: false },
+  workboard_start_request_invalid: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_card_not_found: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_card_protected: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_dependencies_unsatisfied: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_state_conflict: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_already_claimed: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_active_execution: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_already_reserved: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_retry_budget_exhausted: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_stored_record_invalid: { ok: false, outcome: "refused", retryable: false },
+  workboard_start_migration_required: { ok: false, outcome: "refused", retryable: false },
+  workboard_unavailable: { ok: false, outcome: "failed", retryable: true },
+  workboard_storage_failure: { ok: false, outcome: "failed", retryable: true },
+  workboard_result_uncertain: { ok: false, outcome: "failed", retryable: true },
+};
+
+// Frozen request shape (contract §7, closed set). Unknown, missing, or malformed fields
+// are invalid.
+export type WorkboardStartWorkerSpec = {
+  engine: string;
+  mode: string;
+  model: string | null;
+  session_key: string | null;
+};
+
+export type StartCardRequestV1 = {
+  schema_version: 1;
+  card_id: string;
+  attempt_id: string;
+  authority_id: string;
+  expected_status: string;
+  expected_updated_at: number;
+  required_dependency_state: "all_parents_done" | "none";
+  forbidden_labels: string[];
+  expected_assignee: string | null;
+  worker: WorkboardStartWorkerSpec;
+};
+
+// Frozen response envelope (contract §7, closed set).
+export type WorkboardStartReservation = {
+  reservation_id: string;
+  attempt_id: string;
+  authority_id: string;
+  reserved_at: number;
+  expires_at: number;
+  worker_bound: boolean;
+};
+
+export type WorkboardStartCardProjectionV1 = {
+  id: string;
+  board_id: string;
+  status: string;
+  labels: string[];
+  agent_id: string | null;
+  claim: WorkboardClaim | null;
+  execution: WorkboardExecution | null;
+  started_at: number | null;
+  updated_at: number;
+};
+
+export type WorkboardStartEvidenceV1 = {
+  kind: "workboard_start_receipt";
+  ref: string;
+};
+
+export type StartCardResponseV1 = {
+  schema_version: 1;
+  ok: boolean;
+  outcome: WorkboardStartOutcome;
+  reason_code: WorkboardStartReasonCode;
+  retryable: boolean;
+  card_id: string | null;
+  reservation: WorkboardStartReservation | null;
+  card: WorkboardStartCardProjectionV1 | null;
+  evidence: WorkboardStartEvidenceV1 | null;
+};
+
+export type ReleaseStartReservationRequestV1 = {
+  schema_version: 1;
+  reservation_id: string;
+  attempt_id: string;
+  reason: string;
+};
+
+export type StartReceiptV1 = {
+  schema_version: 1;
+  id: string;
+  reservation_id: string;
+  attempt_id: string;
+  card_id: string;
+  outcome: WorkboardStartOutcome;
+  reason_code: WorkboardStartReasonCode;
+  created_at: number;
+};
+
+export type StartReceiptLookupResponseV1 = {
+  schema_version: 1;
+  receipt: StartReceiptV1 | null;
+};
+
+// Frozen set of labels that must appear in every StartCardRequestV1.forbidden_labels.
+// The server refuses requests omitting any of them (contract §5, matrix row 9).
+export const MANDATORY_FORBIDDEN_LABELS = [
+  "hold",
+  "operator-merge-only",
+  "operator-controlled",
+] as const;
+
+export type StartCardReceiptRow = {
+  id: string;
+  reservationId: string;
+  attemptId: string;
+  cardId: string;
+  outcome: string;
+  reasonCode: string;
+  createdAt: number;
+};
+
+export type StartReservationRow = {
+  reservationId: string;
+  cardId: string;
+  attemptId: string;
+  authorityId: string;
+  reservedAt: number;
+  expiresAt: number;
+  workerBound: boolean;
+  releasedAt: number | null;
+  releaseReason: string | null;
 };

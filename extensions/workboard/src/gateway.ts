@@ -1,7 +1,13 @@
 // Workboard plugin module implements gateway behavior.
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { OpenClawPluginApi } from "../api.js";
-import { dispatchAndStartWorkboardCards } from "./dispatcher.js";
+import {
+  buildExecution,
+  buildSessionKey,
+  buildWorkerPrompt,
+  dispatchAndStartWorkboardCards,
+  materializeWorkspace,
+} from "./dispatcher.js";
 import { buildAtomicEnvelope, isAtomicCorrelationKey, WorkboardStore } from "./store.js";
 import { WORKBOARD_STATUSES, type WorkboardCard } from "./types.js";
 
@@ -748,6 +754,189 @@ export function registerWorkboardGatewayMethods(params: {
             throw new Error("atomic receipt lookup accepts exactly {id}.");
           }
           respond(true, await store.getAtomicCreateReceipt(requestParams.id));
+        } catch (error) {
+          respondError(respond, error);
+        }
+      },
+      { scope: READ_SCOPE },
+    );
+  }
+
+  // ── OT-GOV-4 boundary (contract v1 §7) ────────────────────────────────────
+  //
+  // Registered whenever the backing store CAN carry the start authority
+  // (SQLite), regardless of schema state, so an absent or partial schema-4
+  // answers with the typed migration_required envelope (§6.15) rather than an
+  // unknown-method error. Worker creation happens strictly AFTER the
+  // reservation commit (§4); a creation failure neutrally releases and returns
+  // a retryable failure (§10) — never a second start.
+  if (store.hasStartCapability()) {
+    api.registerGatewayMethod(
+      "workboard.cards.startIfEligible",
+      async ({ params: requestParams, respond }) => {
+        let response;
+        try {
+          response = await store.startCardIfEligible(requestParams);
+        } catch {
+          respond(true, {
+            schema_version: 1,
+            ok: false,
+            outcome: "failed",
+            reason_code: "workboard_result_uncertain",
+            retryable: true,
+            card_id: null,
+            reservation: null,
+            card: null,
+            evidence: null,
+          });
+          return;
+        }
+        if (response.reason_code !== "workboard_start_reserved" || !response.reservation) {
+          respond(true, response);
+          return;
+        }
+        // Reservation committed — create exactly one worker and bind it.
+        const reservation = response.reservation;
+        const cardId = response.card_id as string;
+        let started: {
+          run: { runId: string };
+          card: NonNullable<Awaited<ReturnType<typeof store.get>>>;
+          sessionKey: string;
+        };
+        try {
+          const card = await store.get(cardId);
+          if (!card) {
+            throw new Error("reserved card vanished before worker creation");
+          }
+          const context = await store.buildWorkerContext(cardId);
+          const sessionKey = buildSessionKey(card);
+          const materialized = await materializeWorkspace({
+            card,
+            worktrees: api.runtime.worktrees,
+            allowManagedWorktrees: false,
+          });
+          const run = await api.runtime.subagent.run({
+            sessionKey,
+            message: buildWorkerPrompt({
+              card,
+              context,
+              ownerId: reservation.authority_id,
+              token: card.metadata?.claim?.token ?? "",
+            }),
+            lane: `workboard:start:${cardId}`,
+            idempotencyKey: `workboard-start:${cardId}:${reservation.reservation_id}`,
+            lightContext: true,
+            deliver: false,
+            ...(materialized.cwd ? { cwd: materialized.cwd } : {}),
+          });
+          started = { run, card, sessionKey };
+        } catch {
+          // §10 — worker CREATION failed after commit: neutral release, then a
+          // retryable failure. F9 (Round 1): storage_failure only when the
+          // rollback (the release) is CONFIRMED; a failed or refused release
+          // leaves the outcome uncertain and the orphan age-detectable.
+          let releaseConfirmed: boolean;
+          try {
+            const released = await store.releaseStartReservation({
+              schema_version: 1,
+              reservation_id: reservation.reservation_id,
+              attempt_id: reservation.attempt_id,
+              reason: "worker-creation-failed",
+            });
+            releaseConfirmed = released.reason_code === "workboard_start_released";
+          } catch {
+            releaseConfirmed = false;
+          }
+          respond(true, {
+            schema_version: 1,
+            ok: false,
+            outcome: "failed",
+            reason_code: releaseConfirmed
+              ? "workboard_storage_failure"
+              : "workboard_result_uncertain",
+            retryable: true,
+            card_id: cardId,
+            reservation: null,
+            card: null,
+            evidence: null,
+          });
+          return;
+        }
+        // F3 (Round 1): the worker EXISTS from this point on — bind FIRST,
+        // before any further bookkeeping, so no later failure can neutrally
+        // release a reservation whose worker is live (release refuses
+        // worker_bound=1). Bookkeeping failures below are reported truthfully
+        // but never release and never start a second worker.
+        const bound = store.bindStartReservationWorker(reservation.reservation_id);
+        try {
+          await store.update(cardId, {
+            sessionKey: started.sessionKey,
+            runId: started.run.runId,
+            execution: buildExecution({
+              card: started.card,
+              sessionKey: started.sessionKey,
+              runId: started.run.runId,
+              model: started.card.execution?.model ?? "unspecified",
+              now: Date.now(),
+            }),
+          });
+          await store.addWorkerLog(
+            cardId,
+            {
+              level: "info",
+              message: `Start authority reserved ${reservation.reservation_id} and started run ${started.run.runId}.`,
+              sessionKey: started.sessionKey,
+              runId: started.run.runId,
+            },
+            {
+              ownerId: reservation.authority_id,
+              token: started.card.metadata?.claim?.token ?? "",
+            },
+          );
+        } catch {
+          // Worker live and bound; execution bookkeeping incomplete. The
+          // closer/orphan machinery reconciles from the session record; a
+          // release here would be the F3 double-start bug.
+        }
+        respond(true, {
+          ...response,
+          reservation: { ...reservation, worker_bound: bound },
+        });
+      },
+      { scope: WRITE_SCOPE },
+    );
+
+    api.registerGatewayMethod(
+      "workboard.cards.releaseStartReservation",
+      async ({ params: requestParams, respond }) => {
+        try {
+          respond(true, await store.releaseStartReservation(requestParams));
+        } catch {
+          respond(true, {
+            schema_version: 1,
+            ok: false,
+            outcome: "failed",
+            reason_code: "workboard_result_uncertain",
+            retryable: true,
+            card_id: null,
+            reservation: null,
+            card: null,
+            evidence: null,
+          });
+        }
+      },
+      { scope: WRITE_SCOPE },
+    );
+
+    api.registerGatewayMethod(
+      "workboard.startReceipts.get",
+      async ({ params: requestParams, respond }) => {
+        try {
+          const paramKeys = Object.keys(requestParams ?? {});
+          if (paramKeys.length !== 1 || paramKeys[0] !== "id") {
+            throw new Error("start receipt lookup accepts exactly {id}.");
+          }
+          respond(true, await store.getStartReceipt(requestParams.id));
         } catch (error) {
           respondError(respond, error);
         }

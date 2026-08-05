@@ -19,6 +19,8 @@ import {
   type WorkboardAtomicJudgeVerdict,
   type WorkboardAtomicReceiptRow,
   type WorkboardAtomicStoredCardRow,
+  type WorkboardStartCapableCardStore,
+  type WorkboardStartStoreRequest,
 } from "./sqlite-store.js";
 import {
   WORKBOARD_ATOMIC_APPROVAL_POLICIES,
@@ -78,6 +80,15 @@ import {
   type CanonicalAutomationCardSpecV1,
   type WorkboardAtomicCardProjectionV1,
   type WorkboardAtomicReasonCode,
+  MANDATORY_FORBIDDEN_LABELS,
+  WORKBOARD_START_REASON_TABLE,
+  type ReleaseStartReservationRequestV1,
+  type StartCardRequestV1,
+  type StartCardResponseV1,
+  type StartReceiptLookupResponseV1,
+  type WorkboardStartCardProjectionV1,
+  type WorkboardStartOutcome,
+  type WorkboardStartReasonCode,
 } from "./types.js";
 export type {
   PersistedWorkboardAttachment,
@@ -3014,6 +3025,243 @@ function atomicReceiptProjection(row: WorkboardAtomicReceiptRow): AtomicCreateRe
   };
 }
 
+// ── OT-GOV-4 free functions (contract v1 §7) ────────────────────────────────
+
+function resolveStartCapability(store: WorkboardKeyedStore): WorkboardStartCapableCardStore | null {
+  const candidate = store as Partial<WorkboardStartCapableCardStore>;
+  if (
+    typeof candidate.startCardIfEligible === "function" &&
+    typeof candidate.releaseStartReservation === "function" &&
+    typeof candidate.bindStartReservationWorker === "function" &&
+    typeof candidate.getStartReceipt === "function" &&
+    typeof candidate.verifyStartMigrationComplete === "function"
+  ) {
+    return candidate as WorkboardStartCapableCardStore;
+  }
+  return null;
+}
+
+const START_REQUEST_KEYS = [
+  "schema_version",
+  "card_id",
+  "attempt_id",
+  "authority_id",
+  "expected_status",
+  "expected_updated_at",
+  "required_dependency_state",
+  "forbidden_labels",
+  "expected_assignee",
+  "worker",
+] as const;
+
+const START_WORKER_KEYS = ["engine", "mode", "model", "session_key"] as const;
+
+const START_RELEASE_KEYS = ["schema_version", "reservation_id", "attempt_id", "reason"] as const;
+
+// §6.4 — validation completes before any lookup or write. The request is a
+// closed set: unknown, missing, or malformed fields are invalid, ids are exact
+// lowercase RFC-4122 UUIDs (a prefix is invalid — §11 row 20), and
+// forbidden_labels must include every mandatory operator-protection label
+// (§11 row 9) so the server never applies a weaker protection set than the
+// contract mandates.
+function validateStartCardRequest(
+  request: unknown,
+): { ok: true; request: StartCardRequestV1 } | { ok: false; cardId: string | null } {
+  if (typeof request !== "object" || request === null || Array.isArray(request)) {
+    return { ok: false, cardId: null };
+  }
+  const record = request as Record<string, unknown>;
+  const cardId = typeof record.card_id === "string" ? record.card_id : null;
+  const keys = Object.keys(record);
+  if (keys.length !== START_REQUEST_KEYS.length) {
+    return { ok: false, cardId };
+  }
+  for (const key of START_REQUEST_KEYS) {
+    if (!Object.hasOwn(record, key)) {
+      return { ok: false, cardId };
+    }
+  }
+  if (record.schema_version !== 1) {
+    return { ok: false, cardId };
+  }
+  if (typeof record.card_id !== "string" || !ATOMIC_UUID_RE.test(record.card_id)) {
+    return { ok: false, cardId };
+  }
+  if (typeof record.attempt_id !== "string" || !ATOMIC_UUID_RE.test(record.attempt_id)) {
+    return { ok: false, cardId };
+  }
+  if (
+    typeof record.authority_id !== "string" ||
+    record.authority_id.length === 0 ||
+    record.authority_id.length > 120
+  ) {
+    return { ok: false, cardId };
+  }
+  if (typeof record.expected_status !== "string" || record.expected_status.length === 0) {
+    return { ok: false, cardId };
+  }
+  if (
+    typeof record.expected_updated_at !== "number" ||
+    !Number.isInteger(record.expected_updated_at) ||
+    record.expected_updated_at <= 0
+  ) {
+    return { ok: false, cardId };
+  }
+  if (
+    record.required_dependency_state !== "all_parents_done" &&
+    record.required_dependency_state !== "none"
+  ) {
+    return { ok: false, cardId };
+  }
+  if (
+    !Array.isArray(record.forbidden_labels) ||
+    record.forbidden_labels.some((label) => typeof label !== "string" || label.length === 0)
+  ) {
+    return { ok: false, cardId };
+  }
+  for (const mandatory of MANDATORY_FORBIDDEN_LABELS) {
+    if (!record.forbidden_labels.includes(mandatory)) {
+      return { ok: false, cardId };
+    }
+  }
+  if (record.expected_assignee !== null && typeof record.expected_assignee !== "string") {
+    return { ok: false, cardId };
+  }
+  const worker = record.worker;
+  if (typeof worker !== "object" || worker === null || Array.isArray(worker)) {
+    return { ok: false, cardId };
+  }
+  const workerRecord = worker as Record<string, unknown>;
+  const workerKeys = Object.keys(workerRecord);
+  if (workerKeys.length !== START_WORKER_KEYS.length) {
+    return { ok: false, cardId };
+  }
+  for (const key of START_WORKER_KEYS) {
+    if (!Object.hasOwn(workerRecord, key)) {
+      return { ok: false, cardId };
+    }
+  }
+  if (typeof workerRecord.engine !== "string" || workerRecord.engine.length === 0) {
+    return { ok: false, cardId };
+  }
+  if (typeof workerRecord.mode !== "string" || workerRecord.mode.length === 0) {
+    return { ok: false, cardId };
+  }
+  if (workerRecord.model !== null && typeof workerRecord.model !== "string") {
+    return { ok: false, cardId };
+  }
+  if (workerRecord.session_key !== null && typeof workerRecord.session_key !== "string") {
+    return { ok: false, cardId };
+  }
+  return { ok: true, request: record as StartCardRequestV1 };
+}
+
+function validateStartReleaseRequest(
+  request: unknown,
+): { ok: true; request: ReleaseStartReservationRequestV1 } | { ok: false } {
+  if (typeof request !== "object" || request === null || Array.isArray(request)) {
+    return { ok: false };
+  }
+  const record = request as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length !== START_RELEASE_KEYS.length) {
+    return { ok: false };
+  }
+  for (const key of START_RELEASE_KEYS) {
+    if (!Object.hasOwn(record, key)) {
+      return { ok: false };
+    }
+  }
+  if (record.schema_version !== 1) {
+    return { ok: false };
+  }
+  if (typeof record.reservation_id !== "string" || !ATOMIC_UUID_RE.test(record.reservation_id)) {
+    return { ok: false };
+  }
+  if (typeof record.attempt_id !== "string" || !ATOMIC_UUID_RE.test(record.attempt_id)) {
+    return { ok: false };
+  }
+  if (
+    typeof record.reason !== "string" ||
+    record.reason.length === 0 ||
+    record.reason.length > 400
+  ) {
+    return { ok: false };
+  }
+  return { ok: true, request: record as ReleaseStartReservationRequestV1 };
+}
+
+const START_RESERVATION_TTL_MS = 600_000;
+
+function buildStartStoreRequest(request: StartCardRequestV1): WorkboardStartStoreRequest {
+  return {
+    cardId: request.card_id,
+    attemptId: request.attempt_id,
+    authorityId: request.authority_id,
+    expectedStatus: request.expected_status,
+    expectedUpdatedAt: request.expected_updated_at,
+    requiredDependencyState: request.required_dependency_state,
+    forbiddenLabels: request.forbidden_labels,
+    expectedAssignee: request.expected_assignee,
+    reservationId: randomUUID(),
+    receiptId: randomUUID(),
+    eventId: randomUUID(),
+    claimToken: randomUUID(),
+    worker: {
+      engine: request.worker.engine,
+      mode: request.worker.mode,
+      model: request.worker.model,
+      sessionKey: request.worker.session_key,
+    },
+    now: Date.now(),
+    ttlMs: START_RESERVATION_TTL_MS,
+  };
+}
+
+function startCardProjection(card: WorkboardCard): WorkboardStartCardProjectionV1 {
+  // F1 (Round 1): the claim token is the ownership credential the legacy
+  // surfaces accept — it must never leave the server. Redacted on EVERY path,
+  // refusals included, matching the gateway-wide redactClaimToken discipline.
+  const claim = card.metadata?.claim ?? null;
+  return {
+    id: card.id,
+    board_id: cardBoardId(card),
+    status: card.status,
+    labels: [...card.labels],
+    agent_id: card.agentId ?? null,
+    claim: claim ? { ...claim, token: "[redacted]" } : null,
+    execution: card.execution ?? null,
+    started_at: card.startedAt ?? null,
+    updated_at: card.updatedAt,
+  };
+}
+
+// The closed §7 envelope. reason_code fixes ok/outcome/retryable through the
+// frozen WORKBOARD_START_REASON_TABLE; evidence exists only when a durable
+// receipt row does (§6.14).
+function buildStartEnvelope(
+  reasonCode: WorkboardStartReasonCode,
+  extras: {
+    cardId: string | null;
+    card?: WorkboardStartCardProjectionV1 | null;
+    reservation?: StartCardResponseV1["reservation"];
+    receiptId?: string;
+  },
+): StartCardResponseV1 {
+  const mapping = WORKBOARD_START_REASON_TABLE[reasonCode];
+  return {
+    schema_version: 1,
+    ok: mapping.ok,
+    outcome: mapping.outcome,
+    reason_code: reasonCode,
+    retryable: mapping.retryable,
+    card_id: extras.cardId,
+    reservation: extras.reservation ?? null,
+    card: extras.card ?? null,
+    evidence: extras.receiptId ? { kind: "workboard_start_receipt", ref: extras.receiptId } : null,
+  };
+}
+
 function resolveAtomicCapability(
   store: WorkboardKeyedStore,
 ): WorkboardAtomicCapableCardStore | null {
@@ -3718,6 +3966,169 @@ export class WorkboardStore {
   supportsAtomicCreate(): boolean {
     const atomic = resolveAtomicCapability(this.store);
     return atomic !== null && atomic.verifyAtomicMigrationComplete();
+  }
+
+  // ── OT-GOV-4: start authority (contract v1 §7) ────────────────────────────
+
+  // The gateway registers the start surface whenever the backing store CAN
+  // carry it (SQLite), regardless of schema state, so an absent or partial
+  // schema-4 answers with the typed workboard_start_migration_required
+  // envelope (§6.15) instead of an unknown-method error.
+  hasStartCapability(): boolean {
+    return resolveStartCapability(this.store) !== null;
+  }
+
+  // The sole production boundary for starting a worker (§1). Request validation
+  // completes before any lookup (§6.4); the transactional core lives in the
+  // SQLite store; this layer owns grammar, the closed envelope, and outcome
+  // mapping. Every refusal from the core was a pure read (§5).
+  async startCardIfEligible(request: unknown): Promise<StartCardResponseV1> {
+    const validated = validateStartCardRequest(request);
+    if (!validated.ok) {
+      return buildStartEnvelope("workboard_start_request_invalid", { cardId: validated.cardId });
+    }
+    const start = resolveStartCapability(this.store);
+    if (!start) {
+      return buildStartEnvelope("workboard_start_migration_required", {
+        cardId: validated.request.card_id,
+      });
+    }
+    let result: ReturnType<WorkboardStartCapableCardStore["startCardIfEligible"]>;
+    try {
+      result = start.startCardIfEligible(buildStartStoreRequest(validated.request));
+    } catch {
+      return buildStartEnvelope("workboard_result_uncertain", {
+        cardId: validated.request.card_id,
+      });
+    }
+    switch (result.kind) {
+      case "migration_required":
+        return buildStartEnvelope("workboard_start_migration_required", {
+          cardId: validated.request.card_id,
+        });
+      case "unavailable":
+        return buildStartEnvelope("workboard_unavailable", { cardId: validated.request.card_id });
+      case "storage_failure":
+        return buildStartEnvelope("workboard_storage_failure", {
+          cardId: validated.request.card_id,
+        });
+      case "uncertain":
+        return buildStartEnvelope("workboard_result_uncertain", {
+          cardId: validated.request.card_id,
+        });
+      case "refused":
+        return buildStartEnvelope(result.reasonCode, {
+          cardId: validated.request.card_id,
+          card: result.card ? startCardProjection(result.card) : null,
+        });
+      case "reserved":
+      case "recovered":
+        return buildStartEnvelope(
+          result.kind === "reserved" ? "workboard_start_reserved" : "workboard_start_recovered",
+          {
+            cardId: validated.request.card_id,
+            card: startCardProjection(result.card),
+            reservation: {
+              reservation_id: result.reservation.reservationId,
+              attempt_id: result.reservation.attemptId,
+              authority_id: result.reservation.authorityId,
+              reserved_at: result.reservation.reservedAt,
+              expires_at: result.reservation.expiresAt,
+              worker_bound: result.reservation.workerBound,
+            },
+            receiptId: result.receiptId,
+          },
+        );
+    }
+    return buildStartEnvelope("workboard_result_uncertain", {
+      cardId: validated.request.card_id,
+    });
+  }
+
+  // §10 — neutral release. Same envelope shape, outcome "released" or a typed
+  // refusal; never touches failureCount and never starts anything.
+  async releaseStartReservation(request: unknown): Promise<StartCardResponseV1> {
+    const validated = validateStartReleaseRequest(request);
+    if (!validated.ok) {
+      return buildStartEnvelope("workboard_start_request_invalid", { cardId: null });
+    }
+    const start = resolveStartCapability(this.store);
+    if (!start) {
+      return buildStartEnvelope("workboard_start_migration_required", { cardId: null });
+    }
+    let result: ReturnType<WorkboardStartCapableCardStore["releaseStartReservation"]>;
+    try {
+      result = start.releaseStartReservation({
+        reservationId: validated.request.reservation_id,
+        attemptId: validated.request.attempt_id,
+        reason: validated.request.reason,
+        receiptId: randomUUID(),
+        eventId: randomUUID(),
+        now: Date.now(),
+      });
+    } catch {
+      return buildStartEnvelope("workboard_result_uncertain", { cardId: null });
+    }
+    switch (result.kind) {
+      case "migration_required":
+        return buildStartEnvelope("workboard_start_migration_required", { cardId: null });
+      case "unavailable":
+        return buildStartEnvelope("workboard_unavailable", { cardId: null });
+      case "storage_failure":
+        return buildStartEnvelope("workboard_storage_failure", { cardId: null });
+      case "uncertain":
+        return buildStartEnvelope("workboard_result_uncertain", { cardId: null });
+      case "refused":
+        return buildStartEnvelope(result.reasonCode, { cardId: null });
+      case "released":
+        return buildStartEnvelope("workboard_start_released", {
+          cardId: result.reservation.cardId,
+          reservation: {
+            reservation_id: result.reservation.reservationId,
+            attempt_id: result.reservation.attemptId,
+            authority_id: result.reservation.authorityId,
+            reserved_at: result.reservation.reservedAt,
+            expires_at: result.reservation.expiresAt,
+            worker_bound: result.reservation.workerBound,
+          },
+          receiptId: result.receiptId,
+        });
+    }
+    return buildStartEnvelope("workboard_result_uncertain", { cardId: null });
+  }
+
+  // Read-only receipt lookup. A malformed or unknown id resolves to null.
+  async getStartReceipt(id: unknown): Promise<StartReceiptLookupResponseV1> {
+    const start = resolveStartCapability(this.store);
+    if (!start || typeof id !== "string" || !ATOMIC_UUID_RE.test(id)) {
+      return { schema_version: 1, receipt: null };
+    }
+    const row = start.getStartReceipt(id);
+    if (!row) {
+      return { schema_version: 1, receipt: null };
+    }
+    return {
+      schema_version: 1,
+      receipt: {
+        schema_version: 1,
+        id: row.id,
+        reservation_id: row.reservationId,
+        attempt_id: row.attemptId,
+        card_id: row.cardId,
+        outcome: row.outcome as WorkboardStartOutcome,
+        reason_code: row.reasonCode as WorkboardStartReasonCode,
+        created_at: row.createdAt,
+      },
+    };
+  }
+
+  // §4 — worker binding, after commit, exactly once.
+  bindStartReservationWorker(reservationId: string): boolean {
+    const start = resolveStartCapability(this.store);
+    if (!start || typeof reservationId !== "string" || !ATOMIC_UUID_RE.test(reservationId)) {
+      return false;
+    }
+    return start.bindStartReservationWorker(reservationId);
   }
 
   async delete(id: string): Promise<{ deleted: boolean; archived?: boolean }> {

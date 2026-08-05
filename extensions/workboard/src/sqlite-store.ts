@@ -761,7 +761,7 @@ function ensureWorkboardAtomicSchema(db: DatabaseSync): boolean {
 // ============================================================
 
 // Exact schema-4 object DDL for the start reservation table.
-function startReservationTableDdl(): string {
+function startReceiptsTableDdl(): string {
   const durableReasons = START_RECEIPT_REASON_OUTCOME_PAIRS.map(([reason]) => `'${reason}'`).join(
     ", ",
   );
@@ -821,7 +821,7 @@ WHERE released_at IS NULL`,
     {
       type: "table",
       name: START_RECEIPTS_TABLE,
-      ddl: startReservationTableDdl(),
+      ddl: startReceiptsTableDdl(),
     },
     {
       type: "trigger",
@@ -836,6 +836,33 @@ BEGIN SELECT RAISE(ABORT, 'workboard start receipts are append-only'); END`,
       ddl: `CREATE TRIGGER workboard_start_receipts_no_delete
 BEFORE DELETE ON workboard_start_receipts
 BEGIN SELECT RAISE(ABORT, 'workboard start receipts are append-only'); END`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_card_start_reservations_immutable",
+      ddl: `CREATE TRIGGER workboard_card_start_reservations_immutable
+BEFORE UPDATE ON workboard_card_start_reservations
+WHEN NEW.reservation_id != OLD.reservation_id
+  OR NEW.card_id != OLD.card_id
+  OR NEW.attempt_id != OLD.attempt_id
+  OR NEW.authority_id != OLD.authority_id
+  OR NEW.reserved_at != OLD.reserved_at
+  OR NEW.expires_at != OLD.expires_at
+  OR (OLD.released_at IS NOT NULL AND NEW.released_at IS NULL)
+  OR (OLD.released_at IS NOT NULL AND NEW.released_at != OLD.released_at)
+  OR (OLD.worker_bound = 1 AND NEW.worker_bound = 0)
+BEGIN
+  SELECT RAISE(ABORT, 'start reservation identity and release state are immutable');
+END`,
+    },
+    {
+      type: "trigger",
+      name: "workboard_card_start_reservations_no_delete",
+      ddl: `CREATE TRIGGER workboard_card_start_reservations_no_delete
+BEFORE DELETE ON workboard_card_start_reservations
+BEGIN
+  SELECT RAISE(ABORT, 'start reservations are immutable history; release, never delete');
+END`,
     },
     {
       type: "trigger",
@@ -2411,20 +2438,44 @@ class WorkboardSqliteCardStore
         return refuse("workboard_start_request_invalid");
       }
       if (replay) {
-        this.insertStartReceipt({
-          id: request.receiptId,
-          reservationId: replay.reservationId,
-          attemptId: replay.attemptId,
-          cardId: request.cardId,
-          outcome: "recovered",
-          reasonCode: "workboard_start_recovered",
-          createdAt: request.now,
-        });
-        atomicTestCrashPoint("start-before-commit");
-        phase = "commit";
-        this.db.exec("COMMIT");
-        atomicTestCrashPoint("start-after-commit");
-        return { kind: "recovered", reservation: replay, card, receiptId: request.receiptId };
+        // F4 (Round 1) — §6.2: a replay CREATES NOTHING. The evidence is the
+        // ORIGINAL reserved receipt, read inside the same transaction; a
+        // reservation without its reserved receipt is a corrupted record.
+        const originalReceipt = this.db
+          .prepare(
+            `SELECT id FROM ${START_RECEIPTS_TABLE}
+             WHERE reservation_id = ? AND reason_code = 'workboard_start_reserved'`,
+          )
+          .get(replay.reservationId) as Row | undefined;
+        if (!originalReceipt) {
+          return refuse("workboard_start_stored_record_invalid");
+        }
+        this.db.exec("ROLLBACK");
+        return {
+          kind: "recovered",
+          reservation: replay,
+          card,
+          receiptId: requiredString(originalReceipt, "id"),
+        };
+      }
+      // F5 (Round 1) — §11 row 4: the unreleased-reservation refusal must
+      // outrank CAS, because a committed reservation always changes exactly
+      // the state CAS inspects; concurrent losers owe `already_reserved`,
+      // never `state_conflict`. (Row 24: a corrupted stored row refuses and
+      // is never repaired.)
+      let activeEarly: StartReservationRow | null = null;
+      try {
+        const activeRow = this.db
+          .prepare(
+            `SELECT * FROM ${START_RESERVATIONS_TABLE} WHERE card_id = ? AND released_at IS NULL`,
+          )
+          .get(request.cardId) as Row | undefined;
+        activeEarly = activeRow ? mapStartReservation(activeRow) : null;
+      } catch {
+        return refuse("workboard_start_stored_record_invalid");
+      }
+      if (activeEarly) {
+        return refuse("workboard_start_already_reserved");
       }
       // §6.6 — CAS staleness checks refuse without mutation.
       if (card.status !== request.expectedStatus || card.updatedAt !== request.expectedUpdatedAt) {
@@ -2461,23 +2512,6 @@ class WorkboardSqliteCardStore
         return refuse("workboard_start_retry_budget_exhausted");
       }
 
-      // §6.1 — at most one unreleased reservation per card; a different
-      // attempt against a reserved card is refused, pure read. (Row 24: a
-      // corrupted stored row refuses and is never repaired.)
-      let active: StartReservationRow | null = null;
-      try {
-        const activeRow = this.db
-          .prepare(
-            `SELECT * FROM ${START_RESERVATIONS_TABLE} WHERE card_id = ? AND released_at IS NULL`,
-          )
-          .get(request.cardId) as Row | undefined;
-        active = activeRow ? mapStartReservation(activeRow) : null;
-      } catch {
-        return refuse("workboard_start_stored_record_invalid");
-      }
-      if (active) {
-        return refuse("workboard_start_already_reserved");
-      }
 
       // Fully eligible — the §4 permitted effects, all in this transaction.
       this.db
@@ -2640,23 +2674,53 @@ class WorkboardSqliteCardStore
            WHERE id = ? AND card_id = ?`,
         )
         .run(request.now, reservation.attemptId, reservation.cardId);
-      this.db
-        .prepare(
-          `UPDATE workboard_cards
-             SET claim_json = NULL,
-                 status = CASE WHEN status = 'running' THEN 'ready' ELSE status END,
-                 updated_at = ?
-           WHERE id = ?`,
-        )
-        .run(request.now, reservation.cardId);
+      // F11 (Round 1): clear ONLY the reservation's own claim. After the
+      // reservation TTL lapses a legacy claim() by another owner can succeed;
+      // a late neutral release must not destroy that foreign claim.
+      const cardRow = this.db
+        .prepare("SELECT status, claim_json FROM workboard_cards WHERE id = ?")
+        .get(reservation.cardId) as Row | undefined;
+      const fromStatus = cardRow ? String(cardRow.status) : null;
+      let ownClaim = false;
+      if (cardRow && typeof cardRow.claim_json === "string") {
+        try {
+          const storedClaim = JSON.parse(cardRow.claim_json) as {
+            ownerId?: unknown;
+            claimedAt?: unknown;
+          };
+          ownClaim =
+            storedClaim.ownerId === reservation.authorityId &&
+            storedClaim.claimedAt === reservation.reservedAt;
+        } catch {
+          ownClaim = false;
+        }
+      }
+      const toStatus = ownClaim && fromStatus === "running" ? "ready" : fromStatus;
+      if (ownClaim) {
+        this.db
+          .prepare(
+            `UPDATE workboard_cards
+               SET claim_json = NULL,
+                   status = CASE WHEN status = 'running' THEN 'ready' ELSE status END,
+                   updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(request.now, reservation.cardId);
+      } else {
+        this.db
+          .prepare("UPDATE workboard_cards SET updated_at = ? WHERE id = ?")
+          .run(request.now, reservation.cardId);
+      }
+      // F10 (Round 1): the event records the transition that actually
+      // happened, never a hardcoded one.
       const eventOrdinal = nextChildOrdinal(this.db, "workboard_card_events", reservation.cardId);
       this.db
         .prepare(
           `INSERT INTO workboard_card_events
              (id, card_id, ordinal, kind, at, from_status, to_status)
-           VALUES (?, ?, ?, 'start_released', ?, 'running', 'ready')`,
+           VALUES (?, ?, ?, 'start_released', ?, ?, ?)`,
         )
-        .run(request.eventId, reservation.cardId, eventOrdinal, request.now);
+        .run(request.eventId, reservation.cardId, eventOrdinal, request.now, fromStatus, toStatus);
       this.insertStartReceipt({
         id: request.receiptId,
         reservationId: reservation.reservationId,

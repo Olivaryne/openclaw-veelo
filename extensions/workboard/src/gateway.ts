@@ -798,19 +798,22 @@ export function registerWorkboardGatewayMethods(params: {
         // Reservation committed — create exactly one worker and bind it.
         const reservation = response.reservation;
         const cardId = response.card_id as string;
+        let run: { runId: string } | null = null;
+        let card: Awaited<ReturnType<typeof store.get>>;
+        let sessionKey = "";
         try {
-          const card = await store.get(cardId);
+          card = await store.get(cardId);
           if (!card) {
             throw new Error("reserved card vanished before worker creation");
           }
           const context = await store.buildWorkerContext(cardId);
-          const sessionKey = buildSessionKey(card);
+          sessionKey = buildSessionKey(card);
           const materialized = await materializeWorkspace({
             card,
             worktrees: api.runtime.worktrees,
             allowManagedWorktrees: false,
           });
-          const run = await api.runtime.subagent.run({
+          run = await api.runtime.subagent.run({
             sessionKey,
             message: buildWorkerPrompt({
               card,
@@ -824,6 +827,45 @@ export function registerWorkboardGatewayMethods(params: {
             deliver: false,
             ...(materialized.cwd ? { cwd: materialized.cwd } : {}),
           });
+        } catch {
+          // §10 — worker CREATION failed after commit: neutral release, then a
+          // retryable failure. F9 (Round 1): storage_failure only when the
+          // rollback (the release) is CONFIRMED; a failed or refused release
+          // leaves the outcome uncertain and the orphan age-detectable.
+          let releaseConfirmed = false;
+          try {
+            const released = await store.releaseStartReservation({
+              schema_version: 1,
+              reservation_id: reservation.reservation_id,
+              attempt_id: reservation.attempt_id,
+              reason: "worker-creation-failed",
+            });
+            releaseConfirmed = released.reason_code === "workboard_start_released";
+          } catch {
+            releaseConfirmed = false;
+          }
+          respond(true, {
+            schema_version: 1,
+            ok: false,
+            outcome: "failed",
+            reason_code: releaseConfirmed
+              ? "workboard_storage_failure"
+              : "workboard_result_uncertain",
+            retryable: true,
+            card_id: cardId,
+            reservation: null,
+            card: null,
+            evidence: null,
+          });
+          return;
+        }
+        // F3 (Round 1): the worker EXISTS from this point on — bind FIRST,
+        // before any further bookkeeping, so no later failure can neutrally
+        // release a reservation whose worker is live (release refuses
+        // worker_bound=1). Bookkeeping failures below are reported truthfully
+        // but never release and never start a second worker.
+        const bound = store.bindStartReservationWorker(reservation.reservation_id);
+        try {
           await store.update(cardId, {
             sessionKey,
             runId: run.runId,
@@ -835,7 +877,6 @@ export function registerWorkboardGatewayMethods(params: {
               now: Date.now(),
             }),
           });
-          store.bindStartReservationWorker(reservation.reservation_id);
           await store.addWorkerLog(
             cardId,
             {
@@ -846,36 +887,15 @@ export function registerWorkboardGatewayMethods(params: {
             },
             { ownerId: reservation.authority_id, token: card.metadata?.claim?.token ?? "" },
           );
-          respond(true, {
-            ...response,
-            reservation: { ...reservation, worker_bound: true },
-          });
         } catch {
-          // §10 — worker creation failed after commit: neutral release, then a
-          // retryable failure. The release is itself best-effort; if it fails
-          // the orphan stays detectable by reservation age (§3).
-          try {
-            await store.releaseStartReservation({
-              schema_version: 1,
-              reservation_id: reservation.reservation_id,
-              attempt_id: reservation.attempt_id,
-              reason: "worker-creation-failed",
-            });
-          } catch {
-            // orphan remains; age-detectable
-          }
-          respond(true, {
-            schema_version: 1,
-            ok: false,
-            outcome: "failed",
-            reason_code: "workboard_storage_failure",
-            retryable: true,
-            card_id: cardId,
-            reservation: null,
-            card: null,
-            evidence: null,
-          });
+          // Worker live and bound; execution bookkeeping incomplete. The
+          // closer/orphan machinery reconciles from the session record; a
+          // release here would be the F3 double-start bug.
         }
+        respond(true, {
+          ...response,
+          reservation: { ...reservation, worker_bound: bound },
+        });
       },
       { scope: WRITE_SCOPE },
     );

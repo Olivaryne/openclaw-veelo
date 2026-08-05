@@ -939,6 +939,45 @@ describe("OT-GOV-4 start authority gateway methods", () => {
     }
   });
 
+  it("[F3] bookkeeping failure after a live worker binds first and never releases", async () => {
+    const subagent = vi.fn(async () => ({ runId: "run-f3" }));
+    const ctx = sqliteStore();
+    try {
+      const { api, methods } = captureApiWithRuntime(subagent);
+      registerWorkboardGatewayMethods({ api, store: ctx.store });
+      const card = await ctx.store.create({ title: "f3 ordering", status: "ready" });
+      // store.update throws AFTER the worker exists — the old ordering would
+      // neutral-release a live worker's reservation here (the F3 double-start).
+      const updateSpy = vi.spyOn(ctx.store, "update").mockRejectedValueOnce(new Error("bookkeeping down"));
+      const response = await invoke(methods, "workboard.cards.startIfEligible", gatewayStartRequest(card));
+      updateSpy.mockRestore();
+      const envelope = response.payload as {
+        ok: boolean;
+        reason_code: string;
+        reservation: { worker_bound: boolean; reservation_id: string; attempt_id: string };
+      };
+      // The worker exists, so the response is the truth: reserved and bound.
+      expect(envelope.ok).toBe(true);
+      expect(envelope.reason_code).toBe("workboard_start_reserved");
+      expect(envelope.reservation.worker_bound).toBe(true);
+      expect(subagent).toHaveBeenCalledTimes(1);
+      // The reservation is bound, NOT released — and a bound reservation
+      // refuses release, so no retry can ever double-start this card.
+      const release = await ctx.store.releaseStartReservation({
+        schema_version: 1,
+        reservation_id: envelope.reservation.reservation_id,
+        attempt_id: envelope.reservation.attempt_id,
+        reason: "should-refuse",
+      });
+      expect(release.reason_code).toBe("workboard_start_state_conflict");
+      const after = await ctx.store.get(card.id);
+      expect(after?.status).toBe("running");
+      expect(after?.metadata?.claim).toBeTruthy();
+    } finally {
+      ctx.close();
+    }
+  });
+
   it("release round-trips through the gateway and the receipt lookup accepts exactly {id}", async () => {
     const subagent = vi.fn(async () => ({ runId: "run-0003" }));
     const ctx = sqliteStore();

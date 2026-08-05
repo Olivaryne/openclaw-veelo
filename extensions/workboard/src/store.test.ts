@@ -4551,6 +4551,9 @@ describe("OT-GOV-4 start authority (store layer)", () => {
       expect(replay.reason_code).toBe("workboard_start_recovered");
       expect(replay.outcome).toBe("recovered");
       expect(replay.reservation?.reservation_id).toBe(first.reservation?.reservation_id);
+      // §6.2 — a replay creates NOTHING: the evidence is the ORIGINAL reserved
+      // receipt, and the receipt table does not grow (F4, Round 1).
+      expect(replay.evidence?.ref).toBe(first.evidence?.ref);
       const db = new DatabaseSync(ctx.dbPath);
       const rows = db
         .prepare("SELECT COUNT(*) AS n FROM workboard_card_start_reservations WHERE card_id = ?")
@@ -4558,9 +4561,13 @@ describe("OT-GOV-4 start authority (store layer)", () => {
       const attempts = db
         .prepare("SELECT COUNT(*) AS n FROM workboard_card_attempts WHERE card_id = ?")
         .get(card.id) as { n: number | bigint };
+      const receipts = db
+        .prepare("SELECT COUNT(*) AS n FROM workboard_start_receipts WHERE card_id = ?")
+        .get(card.id) as { n: number | bigint };
       db.close();
       expect(Number(rows.n)).toBe(1);
       expect(Number(attempts.n)).toBe(1);
+      expect(Number(receipts.n)).toBe(1);
     } finally {
       ctx.close();
     }
@@ -4804,10 +4811,19 @@ describe("OT-GOV-4 start authority (store layer)", () => {
       const first = await ctx.store.startCardIfEligible(startRequest(card));
       expect(first.reason_code).toBe("workboard_start_reserved");
       const db = new DatabaseSync(ctx.dbPath);
-      // Null out a NOT NULL-adjacent field the mapper requires via direct SQL.
+      // The immutability trigger (F6) refuses this UPDATE, so simulate
+      // out-of-band tampering below the trigger layer: drop, corrupt, and
+      // recreate the trigger byte-exactly (the schema verifier requires it).
+      const triggerDdl = (
+        db
+          .prepare("SELECT sql FROM sqlite_master WHERE name = 'workboard_card_start_reservations_immutable'")
+          .get() as { sql: string }
+      ).sql;
+      db.exec("DROP TRIGGER workboard_card_start_reservations_immutable");
       db.prepare(
         "UPDATE workboard_card_start_reservations SET authority_id = '' WHERE card_id = ?",
       ).run(card.id);
+      db.exec(triggerDdl);
       const corrupted = JSON.stringify(
         db
           .prepare("SELECT * FROM workboard_card_start_reservations WHERE card_id = ?")
@@ -4929,6 +4945,21 @@ describe("OT-GOV-4 start authority (store layer)", () => {
       expect(() => db.prepare("DELETE FROM workboard_cards WHERE id = ?").run(card.id)).toThrow(
         /unreleased start reservations/,
       );
+      // [R35] as specified (F6): a generic UPDATE against reservation identity
+      // columns, an un-release, and an un-bind are all refused BY TRIGGER, and
+      // reservations can never be deleted.
+      for (const sql of [
+        "UPDATE workboard_card_start_reservations SET card_id = attempt_id",
+        "UPDATE workboard_card_start_reservations SET attempt_id = card_id",
+        "UPDATE workboard_card_start_reservations SET authority_id = 'poached'",
+        "UPDATE workboard_card_start_reservations SET reserved_at = 1",
+        "UPDATE workboard_card_start_reservations SET expires_at = 1",
+      ]) {
+        expect(() => db.prepare(sql).run()).toThrow(/immutable/);
+      }
+      expect(() =>
+        db.prepare("DELETE FROM workboard_card_start_reservations").run(),
+      ).toThrow(/never delete/);
       const before = JSON.stringify(
         db
           .prepare("SELECT * FROM workboard_card_start_reservations WHERE card_id = ?")
@@ -4959,6 +4990,39 @@ describe("OT-GOV-4 start authority (store layer)", () => {
       await expect(ctx.store.claim(card.id, { ownerId: "poacher" })).rejects.toThrow(
         /already claimed/,
       );
+    } finally {
+      ctx.close();
+    }
+  });
+
+  it("[F1] the claim token never leaves the server: reserved and already_claimed envelopes are redacted", async () => {
+    const ctx = openStartStore();
+    try {
+      const card = await ctx.store.create({ title: "token safety", status: "ready" });
+      const reserved = await ctx.store.startCardIfEligible(startRequest(card));
+      expect(reserved.reason_code).toBe("workboard_start_reserved");
+      expect(reserved.card?.claim?.token).toBe("[redacted]");
+      const liveToken = (await ctx.store.get(card.id))?.metadata?.claim?.token;
+      expect(liveToken).toBeTruthy();
+      expect(liveToken).not.toBe("[redacted]");
+      expect(JSON.stringify(reserved)).not.toContain(liveToken as string);
+      // A different attempt refused on the reserved card must not leak the
+      // live holder's token either.
+      const fresh = await ctx.store.get(card.id);
+      const refused = await ctx.store.startCardIfEligible(
+        startRequest(
+          { id: card.id, status: fresh?.status ?? "running", updatedAt: fresh?.updatedAt ?? 0 },
+          { expected_assignee: fresh?.agentId ?? null },
+        ),
+      );
+      expect(refused.ok).toBe(false);
+      const serialized = JSON.stringify(refused);
+      const realToken = fresh?.metadata?.claim?.token;
+      expect(realToken).toBeTruthy();
+      expect(serialized).not.toContain(realToken as string);
+      if (refused.card?.claim) {
+        expect(refused.card.claim.token).toBe("[redacted]");
+      }
     } finally {
       ctx.close();
     }

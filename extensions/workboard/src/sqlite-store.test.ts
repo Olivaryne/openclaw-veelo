@@ -1871,13 +1871,47 @@ describe("OT-GOV-4 start authority (process races and crash points)", () => {
           { expected_assignee: fresh?.agentId ?? null },
         ),
       );
-      expect([
-        "workboard_start_already_reserved",
-        "workboard_start_already_claimed",
-        "workboard_start_active_execution",
-      ]).toContain(blocked.reason_code);
-      // Orphan age is detectable from expires_at [R29].
-      expect(envelope.reservation.expires_at).toBeGreaterThan(Date.now() - 60_000);
+      // Exact blocking reason across restart (F5, Round 1).
+      expect(blocked.reason_code).toBe("workboard_start_already_reserved");
+      // [R29]/F12: orphan-age detection distinguishes live from expired.
+      // This fresh reservation is LIVE (expires_at in the future) ...
+      expect(envelope.reservation.expires_at).toBeGreaterThan(Date.now());
+      // ... while a reservation whose TTL elapsed reads as an expired orphan:
+      // reserve at the sqlite layer with a 1ms TTL on a second card.
+      {
+        const orphanCard = await store.create({ title: "expired orphan", status: "ready" });
+        const orphanFresh = await store.get(orphanCard.id);
+        const capable = stores.cards as unknown as {
+          startCardIfEligible: (request: Record<string, unknown>) => { kind: string; reservation: { expiresAt: number; reservationId: string; attemptId: string } };
+        };
+        const direct = capable.startCardIfEligible({
+          cardId: orphanCard.id,
+          attemptId: crypto.randomUUID().toLowerCase(),
+          authorityId: "veelo-start-authority",
+          expectedStatus: orphanFresh?.status ?? "ready",
+          expectedUpdatedAt: orphanFresh?.updatedAt ?? 0,
+          requiredDependencyState: "none",
+          forbiddenLabels: ["hold", "operator-merge-only", "operator-controlled"],
+          expectedAssignee: orphanFresh?.agentId ?? null,
+          reservationId: crypto.randomUUID().toLowerCase(),
+          receiptId: crypto.randomUUID().toLowerCase(),
+          eventId: crypto.randomUUID().toLowerCase(),
+          claimToken: crypto.randomUUID().toLowerCase(),
+          worker: { engine: "codex", mode: "exec", model: null, sessionKey: null },
+          now: Date.now(),
+          ttlMs: 1,
+        });
+        expect(direct.kind).toBe("reserved");
+        expect(direct.reservation.expiresAt).toBeLessThanOrEqual(Date.now());
+        // The expired orphan neutrally releases.
+        const orphanRelease = await store.releaseStartReservation({
+          schema_version: 1,
+          reservation_id: direct.reservation.reservationId,
+          attempt_id: direct.reservation.attemptId,
+          reason: "expired-orphan-recovery",
+        });
+        expect(orphanRelease.reason_code).toBe("workboard_start_released");
+      }
       // Neutral release recovers the card without a failure mark.
       const release = await store.releaseStartReservation({
         schema_version: 1,

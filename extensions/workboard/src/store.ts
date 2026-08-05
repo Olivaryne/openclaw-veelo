@@ -3219,13 +3219,17 @@ function buildStartStoreRequest(request: StartCardRequestV1): WorkboardStartStor
 }
 
 function startCardProjection(card: WorkboardCard): WorkboardStartCardProjectionV1 {
+  // F1 (Round 1): the claim token is the ownership credential the legacy
+  // surfaces accept — it must never leave the server. Redacted on EVERY path,
+  // refusals included, matching the gateway-wide redactClaimToken discipline.
+  const claim = card.metadata?.claim ?? null;
   return {
     id: card.id,
     board_id: cardBoardId(card),
     status: card.status,
     labels: [...card.labels],
     agent_id: card.agentId ?? null,
-    claim: card.metadata?.claim ?? null,
+    claim: claim ? { ...claim, token: "[redacted]" } : null,
     execution: card.execution ?? null,
     started_at: card.startedAt ?? null,
     updated_at: card.updatedAt,
@@ -3965,11 +3969,6 @@ export class WorkboardStore {
   }
 
   // ── OT-GOV-4: start authority (contract v1 §7) ────────────────────────────
-
-  supportsStartAuthority(): boolean {
-    const start = resolveStartCapability(this.store);
-    return start !== null && start.verifyStartMigrationComplete();
-  }
 
   // The gateway registers the start surface whenever the backing store CAN
   // carry it (SQLite), regardless of schema state, so an absent or partial

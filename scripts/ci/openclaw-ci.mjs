@@ -134,7 +134,7 @@ export function validateTargetManifest(value) {
   if (value.schema_version !== "openclaw-ci-target/1") {
     fail("unsupported target schema_version");
   }
-  if (value.target_id !== "AUT-WB-ATOMIC-SRV-1") {
+  if (value.target_id !== "AUT-WB-ATOMIC-SRV-1" && value.target_id !== "OT-GOV-4B") {
     fail("unsupported target_id");
   }
   nonEmptyString(value.repository, "repository");
@@ -153,8 +153,11 @@ export function validateTargetManifest(value) {
   for (const file of [...production, ...tests]) {
     safeRelativePath(file, "permitted file");
   }
-  if (production.length !== 4 || tests.length !== 3) {
-    fail("permitted_files must contain exactly four production and three test files");
+  // Per-target file budgets: AUT-WB-ATOMIC froze 4+3; OT-GOV-4B adds
+  // dispatcher.ts (declared §16 deviation: four mechanical export keywords).
+  const fileBudget = value.target_id === "OT-GOV-4B" ? { production: 5, tests: 3 } : { production: 4, tests: 3 };
+  if (production.length !== fileBudget.production || tests.length !== fileBudget.tests) {
+    fail("permitted_files does not match the target's frozen file budget");
   }
 
   if (!Array.isArray(value.prohibited_path_classes)) {
@@ -279,14 +282,13 @@ export function validateParentAttestation(value, manifest) {
 // The only accepted attestation location. The reader proves the supplied
 // path is this exact regular file inside the exact trusted checkout tree;
 // content validity never rescues an untrusted location.
-const TRUSTED_ATTESTATION_SEGMENTS = [
-  "trusted",
-  "ci",
-  "openclaw",
-  "attestations",
+const TRUSTED_ATTESTATION_FILES = [
   "aut-wb-parent-contract.v1.json",
+  "ot-gov-4-parent-contract.v1.json",
 ];
-const TRUSTED_ATTESTATION_PATH = TRUSTED_ATTESTATION_SEGMENTS.join("/");
+const TRUSTED_ATTESTATION_PATHS = TRUSTED_ATTESTATION_FILES.map((name) =>
+  ["trusted", "ci", "openclaw", "attestations", name].join("/"),
+);
 
 // trustedBaseDir exists only so hermetic tests can stage a synthetic trusted
 // checkout; the CLI never forwards an argument for it, so production always
@@ -303,8 +305,10 @@ function assertTrustedAttestationFile(file, trustedBaseDir) {
   if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
     fail("parent attestation path must be normalized without empty, dot or dot-dot components");
   }
-  if (file !== TRUSTED_ATTESTATION_PATH) {
-    fail(`parent attestation path must be exactly ${TRUSTED_ATTESTATION_PATH}`);
+  if (!TRUSTED_ATTESTATION_PATHS.includes(file)) {
+    fail(
+      `parent attestation path must be one of: ${TRUSTED_ATTESTATION_PATHS.join(", ")}`,
+    );
   }
   if (path.posix.normalize(file) !== file) {
     fail("parent attestation path changes identity under normalization");
@@ -312,8 +316,9 @@ function assertTrustedAttestationFile(file, trustedBaseDir) {
   // Walk every component from the trusted checkout root to the leaf; a
   // symlink anywhere on that chain could swap the governed file for
   // attacker-chosen bytes after the lexical checks.
+  const fileSegments = file.split("/");
   let current = trustedBaseDir;
-  for (const segment of TRUSTED_ATTESTATION_SEGMENTS) {
+  for (const segment of fileSegments) {
     current = path.join(current, segment);
     let stats;
     try {
@@ -329,14 +334,14 @@ function assertTrustedAttestationFile(file, trustedBaseDir) {
     fail("parent attestation must be a regular file");
   }
   const expectedDirectory = fs.realpathSync(
-    path.join(trustedBaseDir, ...TRUSTED_ATTESTATION_SEGMENTS.slice(0, -1)),
+    path.join(trustedBaseDir, ...fileSegments.slice(0, -1)),
   );
   const resolvedDirectory = fs.realpathSync(path.dirname(current));
   if (resolvedDirectory !== expectedDirectory) {
     fail("parent attestation directory escapes the trusted checkout");
   }
   const resolvedFile = fs.realpathSync(current);
-  if (resolvedFile !== path.join(expectedDirectory, TRUSTED_ATTESTATION_SEGMENTS.at(-1))) {
+  if (resolvedFile !== path.join(expectedDirectory, fileSegments.at(-1))) {
     fail("parent attestation file escapes the trusted checkout");
   }
   return current;
@@ -673,6 +678,7 @@ export function validateWorkflowText(text) {
     "name: bounded-receipt",
     "validate-attestation",
     "--parent-attestation trusted/ci/openclaw/attestations/aut-wb-parent-contract.v1.json",
+    "--parent-attestation trusted/ci/openclaw/attestations/ot-gov-4-parent-contract.v1.json",
     "corepack pnpm install --frozen-lockfile",
     "node scripts/run-vitest.mjs extensions/workboard",
     'OPENCLAW_REQUIRE_ROLLBACK_FIXTURE: "1"',

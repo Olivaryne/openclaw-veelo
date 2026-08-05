@@ -948,8 +948,14 @@ describe("OT-GOV-4 start authority gateway methods", () => {
       const card = await ctx.store.create({ title: "f3 ordering", status: "ready" });
       // store.update throws AFTER the worker exists — the old ordering would
       // neutral-release a live worker's reservation here (the F3 double-start).
-      const updateSpy = vi.spyOn(ctx.store, "update").mockRejectedValueOnce(new Error("bookkeeping down"));
-      const response = await invoke(methods, "workboard.cards.startIfEligible", gatewayStartRequest(card));
+      const updateSpy = vi
+        .spyOn(ctx.store, "update")
+        .mockRejectedValueOnce(new Error("bookkeeping down"));
+      const response = await invoke(
+        methods,
+        "workboard.cards.startIfEligible",
+        gatewayStartRequest(card),
+      );
       updateSpy.mockRestore();
       const envelope = response.payload as {
         ok: boolean;

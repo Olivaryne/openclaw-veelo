@@ -798,22 +798,24 @@ export function registerWorkboardGatewayMethods(params: {
         // Reservation committed — create exactly one worker and bind it.
         const reservation = response.reservation;
         const cardId = response.card_id as string;
-        let run: { runId: string } | null = null;
-        let card: Awaited<ReturnType<typeof store.get>>;
-        let sessionKey = "";
+        let started: {
+          run: { runId: string };
+          card: NonNullable<Awaited<ReturnType<typeof store.get>>>;
+          sessionKey: string;
+        };
         try {
-          card = await store.get(cardId);
+          const card = await store.get(cardId);
           if (!card) {
             throw new Error("reserved card vanished before worker creation");
           }
           const context = await store.buildWorkerContext(cardId);
-          sessionKey = buildSessionKey(card);
+          const sessionKey = buildSessionKey(card);
           const materialized = await materializeWorkspace({
             card,
             worktrees: api.runtime.worktrees,
             allowManagedWorktrees: false,
           });
-          run = await api.runtime.subagent.run({
+          const run = await api.runtime.subagent.run({
             sessionKey,
             message: buildWorkerPrompt({
               card,
@@ -827,12 +829,13 @@ export function registerWorkboardGatewayMethods(params: {
             deliver: false,
             ...(materialized.cwd ? { cwd: materialized.cwd } : {}),
           });
+          started = { run, card, sessionKey };
         } catch {
           // §10 — worker CREATION failed after commit: neutral release, then a
           // retryable failure. F9 (Round 1): storage_failure only when the
           // rollback (the release) is CONFIRMED; a failed or refused release
           // leaves the outcome uncertain and the orphan age-detectable.
-          let releaseConfirmed = false;
+          let releaseConfirmed: boolean;
           try {
             const released = await store.releaseStartReservation({
               schema_version: 1,
@@ -867,13 +870,13 @@ export function registerWorkboardGatewayMethods(params: {
         const bound = store.bindStartReservationWorker(reservation.reservation_id);
         try {
           await store.update(cardId, {
-            sessionKey,
-            runId: run.runId,
+            sessionKey: started.sessionKey,
+            runId: started.run.runId,
             execution: buildExecution({
-              card,
-              sessionKey,
-              runId: run.runId,
-              model: card.execution?.model ?? "unspecified",
+              card: started.card,
+              sessionKey: started.sessionKey,
+              runId: started.run.runId,
+              model: started.card.execution?.model ?? "unspecified",
               now: Date.now(),
             }),
           });
@@ -881,11 +884,14 @@ export function registerWorkboardGatewayMethods(params: {
             cardId,
             {
               level: "info",
-              message: `Start authority reserved ${reservation.reservation_id} and started run ${run.runId}.`,
-              sessionKey,
-              runId: run.runId,
+              message: `Start authority reserved ${reservation.reservation_id} and started run ${started.run.runId}.`,
+              sessionKey: started.sessionKey,
+              runId: started.run.runId,
             },
-            { ownerId: reservation.authority_id, token: card.metadata?.claim?.token ?? "" },
+            {
+              ownerId: reservation.authority_id,
+              token: started.card.metadata?.claim?.token ?? "",
+            },
           );
         } catch {
           // Worker live and bound; execution bookkeeping incomplete. The

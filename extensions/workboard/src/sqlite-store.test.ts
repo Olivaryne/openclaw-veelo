@@ -1690,7 +1690,9 @@ describe("OT-GOV-4 start authority (process races and crash points)", () => {
     );
     const deadline = Date.now() + 30_000;
     while (![0, 1].every((i) => fs.existsSync(path.join(workDir, `ready-${i}`)))) {
-      if (Date.now() > deadline) throw new Error("children never became ready");
+      if (Date.now() > deadline) {
+        throw new Error("children never became ready");
+      }
       await sleep(5);
     }
     fs.writeFileSync(go, "go");
@@ -1701,7 +1703,7 @@ describe("OT-GOV-4 start authority (process races and crash points)", () => {
           reason_code: string;
         },
     );
-    const reasons = results.map((r) => r.reason_code).sort();
+    const reasons = results.map((r) => r.reason_code).toSorted();
     // Exactly one reserved; the loser of the race recovers the SAME reservation
     // (identical attempt_id) — never a second row [R3].
     expect(reasons).toEqual(["workboard_start_recovered", "workboard_start_reserved"]);
@@ -1733,7 +1735,9 @@ describe("OT-GOV-4 start authority (process races and crash points)", () => {
         fs.existsSync(f),
       )
     ) {
-      if (Date.now() > deadline) throw new Error("16 children never became ready");
+      if (Date.now() > deadline) {
+        throw new Error("16 children never became ready");
+      }
       await sleep(5);
     }
     fs.writeFileSync(go, "go");
@@ -1876,7 +1880,10 @@ describe("OT-GOV-4 start authority (process races and crash points)", () => {
         const orphanCard = await store.create({ title: "expired orphan", status: "ready" });
         const orphanFresh = await store.get(orphanCard.id);
         const capable = stores.cards as unknown as {
-          startCardIfEligible: (request: Record<string, unknown>) => { kind: string; reservation: { expiresAt: number; reservationId: string; attemptId: string } };
+          startCardIfEligible: (request: Record<string, unknown>) => {
+            kind: string;
+            reservation: { expiresAt: number; reservationId: string; attemptId: string };
+          };
         };
         const direct = capable.startCardIfEligible({
           cardId: orphanCard.id,
@@ -2046,7 +2053,7 @@ describe("OT-GOV-4 start authority (process races and crash points)", () => {
       // Old generic register performs an ordinary edit; the reservation row survives byte-for-byte.
       await oldStores.cards.register(card.id, {
         version: 1,
-        card: { ...(oldRead?.card ?? {}), title: "rollback edit with live reservation" },
+        card: { ...oldRead?.card, title: "rollback edit with live reservation" },
       });
       const rowAfter = JSON.stringify(
         new DatabaseSync(dbPath)

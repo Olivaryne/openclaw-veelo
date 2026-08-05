@@ -885,18 +885,18 @@ type WorkboardStartSchemaState = "complete" | "schema-3-ok" | "refused";
 // objects exist in sqlite_master with exact DDL, and the partial unique index
 // is present as the exclusion point.
 function workboardStartSchemaState(db: DatabaseSync): WorkboardStartSchemaState {
-  const ledger = allMigrationLedgerIds(db).toSorted();
+  const ledgerSet = new Set(allMigrationLedgerIds(db));
   const requiredStartIds = [
     BASE_SCHEMA_MIGRATION_ID,
     ...ATOMIC_SCHEMA_MIGRATION_IDS,
     ...START_SCHEMA_MIGRATION_IDS,
-  ].toSorted();
-  const ledgerHasStart = requiredStartIds.every((id) => ledger.includes(id));
+  ];
+  const ledgerHasStart = requiredStartIds.every((id) => ledgerSet.has(id));
   if (!ledgerHasStart) {
     // Check if schema-3 is complete (prerequisite)
-    const ledgerIsComplete3 = [BASE_SCHEMA_MIGRATION_ID, ...ATOMIC_SCHEMA_MIGRATION_IDS]
-      .toSorted()
-      .every((id) => ledger.includes(id));
+    const ledgerIsComplete3 = [BASE_SCHEMA_MIGRATION_ID, ...ATOMIC_SCHEMA_MIGRATION_IDS].every(
+      (id) => ledgerSet.has(id),
+    );
     if (ledgerIsComplete3) {
       // Schema-3 complete but schema-4 not yet applied — check for partial application
       const objectNames = new Set(startSchemaObjects().map((obj) => obj.name));
@@ -1821,7 +1821,7 @@ function mapStartReservation(row: Row): StartReservationRow {
     workerBound: requiredNumber(row, "worker_bound") === 1,
     releasedAt: releasedAt === null || releasedAt === undefined ? null : Number(releasedAt),
     releaseReason:
-      releaseReason === null || releaseReason === undefined ? null : String(releaseReason),
+      typeof releaseReason === "string" && releaseReason.length > 0 ? releaseReason : null,
   };
 }
 
@@ -2511,7 +2511,6 @@ class WorkboardSqliteCardStore
       if (maxRetries && (card.metadata?.failureCount ?? 0) > maxRetries) {
         return refuse("workboard_start_retry_budget_exhausted");
       }
-
 
       // Fully eligible — the §4 permitted effects, all in this transaction.
       this.db

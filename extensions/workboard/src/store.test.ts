@@ -4816,7 +4816,9 @@ describe("OT-GOV-4 start authority (store layer)", () => {
       // recreate the trigger byte-exactly (the schema verifier requires it).
       const triggerDdl = (
         db
-          .prepare("SELECT sql FROM sqlite_master WHERE name = 'workboard_card_start_reservations_immutable'")
+          .prepare(
+            "SELECT sql FROM sqlite_master WHERE name = 'workboard_card_start_reservations_immutable'",
+          )
           .get() as { sql: string }
       ).sql;
       db.exec("DROP TRIGGER workboard_card_start_reservations_immutable");
@@ -4957,9 +4959,9 @@ describe("OT-GOV-4 start authority (store layer)", () => {
       ]) {
         expect(() => db.prepare(sql).run()).toThrow(/immutable/);
       }
-      expect(() =>
-        db.prepare("DELETE FROM workboard_card_start_reservations").run(),
-      ).toThrow(/never delete/);
+      expect(() => db.prepare("DELETE FROM workboard_card_start_reservations").run()).toThrow(
+        /never delete/,
+      );
       const before = JSON.stringify(
         db
           .prepare("SELECT * FROM workboard_card_start_reservations WHERE card_id = ?")

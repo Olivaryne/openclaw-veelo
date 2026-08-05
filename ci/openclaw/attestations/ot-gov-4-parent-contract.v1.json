@@ -1,0 +1,11 @@
+{
+  "schema_version": "openclaw-private-contract-attestation/1",
+  "source_repository": "Olivaryne/veelo",
+  "source_commit_sha": "71985e16717d31f95ab0dd5d8be80493de1201f9",
+  "source_path": "contracts/review/ot-gov-4-worker-start-authority.v1.md",
+  "source_git_blob_sha": "37bb75fef20569bbbcb5b013e16572a161262760",
+  "source_sha256": "c12d43e63f2751cc8a06747c3ab77d8f28d6a3cca192bc29d6057e0fe2bfb13e",
+  "verification_method": "operator-authenticated-private-source-read",
+  "authority_kind": "digest-attestation",
+  "content_embedded": false
+}

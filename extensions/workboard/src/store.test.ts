@@ -197,6 +197,51 @@ describe("WorkboardStore", () => {
     expect(review.events?.[0]).toMatchObject({ kind: "created", toStatus: "review" });
   });
 
+  it("filters by label, requiring ALL of them", async () => {
+    /*
+     * Why this exists: without a label filter every consumer wanting one card
+     * has to pull the whole board. Veelo's run-report bridge did exactly that
+     * on each cycle to find the single card carrying its loop's fingerprint;
+     * the payload crossed 1.25 MB, execFileSync's 1 MiB default threw ENOBUFS,
+     * and the bridge silently filed duplicates instead — which grew the board
+     * and kept it broken.
+     */
+    const store = new WorkboardStore(createMemoryStore());
+    const both = await store.create({ title: "both", labels: "run-report, fp:heartbeat" });
+    await store.create({ title: "one", labels: "run-report" });
+    await store.create({ title: "other", labels: "fp:heartbeat" });
+    await store.create({ title: "none" });
+
+    expect((await store.list({ labels: ["run-report"] })).map((c) => c.title).toSorted()).toEqual([
+      "both",
+      "one",
+    ]);
+    // AND, not OR: only the card carrying both survives.
+    expect((await store.list({ labels: ["run-report", "fp:heartbeat"] })).map((c) => c.id)).toEqual(
+      [both.id],
+    );
+    expect(await store.list({ labels: ["absent"] })).toEqual([]);
+  });
+
+  it("accepts a comma-separated label filter, like card labels themselves", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const target = await store.create({ title: "target", labels: "a, b" });
+    await store.create({ title: "partial", labels: "a" });
+    expect((await store.list({ labels: "a,b" })).map((c) => c.id)).toEqual([target.id]);
+  });
+
+  it("an absent label filter changes nothing — the filter is strictly opt-in", async () => {
+    // Existing callers (and the shipped --json full-card contract) must see
+    // byte-identical results, so no-filter must not become a filter.
+    const store = new WorkboardStore(createMemoryStore());
+    await store.create({ title: "x", labels: "a" });
+    await store.create({ title: "y" });
+    const baseline = (await store.list()).map((c) => c.id);
+    for (const empty of [undefined, null, [], ""]) {
+      expect((await store.list({ labels: empty })).map((c) => c.id)).toEqual(baseline);
+    }
+  });
+
   it("does not persist empty metadata for default cards", async () => {
     const keyed = createMemoryStore();
     const store = new WorkboardStore(keyed);

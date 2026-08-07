@@ -84,7 +84,15 @@ export function registerWorkboardGatewayMethods(params: {
     async ({ params: requestParams, respond }) => {
       try {
         respond(true, {
-          cards: (await store.list({ boardId: requestParams.boardId })).map(redactClaimToken),
+          // `labels` narrows the result set BEFORE serialization, which is the
+          // point: a caller after one fingerprinted card should not receive —
+          // or have to buffer — the whole board.
+          cards: (
+            await store.list({
+              boardId: requestParams.boardId,
+              labels: requestParams.labels,
+            })
+          ).map(redactClaimToken),
           statuses: WORKBOARD_STATUSES,
         });
       } catch (error) {

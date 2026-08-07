@@ -127,6 +127,11 @@ export function registerWorkboardCli(params: { program: Command; store: Workboar
     .description("List Workboard cards")
     .option("--board <id>", "Board id")
     .option("--status <status>", "Filter by status")
+    .option(
+      "--label <label>",
+      "Only cards carrying this label (repeatable; all must match)",
+      (value: string, previous: string[] | undefined) => [...(previous ?? []), value],
+    )
     .option("--include-archived", "Include archived cards (default false)")
     .option("--json", "Print JSON", false)
     .action(
@@ -134,12 +139,20 @@ export function registerWorkboardCli(params: { program: Command; store: Workboar
         options: JsonOptions & {
           board?: string;
           status?: string;
+          label?: string[];
           includeArchived?: boolean;
         },
       ) => {
         // Text output hides archived cards like /workboard list, while --json
         // keeps the shipped full-card contract for existing scripts.
-        let cards = await params.store.list({ boardId: options.board });
+        //
+        // --label is applied in the STORE rather than here, so a caller asking
+        // for one card gets one card instead of the whole board serialized and
+        // then thrown away. Purely opt-in: omitting it leaves output identical.
+        let cards = await params.store.list({
+          boardId: options.board,
+          labels: options.label,
+        });
         if (!options.json && options.includeArchived !== true) {
           cards = cards.filter((card) => !card.metadata?.archivedAt);
         }

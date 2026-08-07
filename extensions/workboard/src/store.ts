@@ -237,6 +237,17 @@ export type WorkboardDispatchResult = {
 };
 type WorkboardListOptions = {
   boardId?: unknown;
+  /**
+   * Every label here must be present on the card (AND, not OR).
+   *
+   * Without this every consumer that wants one card by label has to pull the
+   * whole board. That is not theoretical: Veelo's run-report bridge listed all
+   * 172 cards on every cycle to find the single card carrying its loop's
+   * fingerprint, the payload crossed 1.25 MB, and execFileSync's 1 MiB default
+   * maxBuffer started throwing ENOBUFS — so the bridge stopped finding the card
+   * and filed a duplicate instead, which made the board bigger.
+   */
+  labels?: unknown;
 };
 type WorkboardDispatchOptions = WorkboardListOptions & {
   now?: unknown;
@@ -3343,15 +3354,25 @@ export class WorkboardStore {
 
   async list(options: WorkboardListOptions = {}): Promise<WorkboardCard[]> {
     const boardId = normalizeBoardId(options.boardId);
+    // Reuses the card-side normalizer so a filter can never be expressed in a
+    // form a card could not hold (same 40-char / 12-entry bounds, same
+    // comma-string-or-array input, same dedupe).
+    const labels = normalizeLabels(options.labels);
     const entries = await this.store.entries();
-    return entries
-      .map((entry) => entry.value)
-      .filter(
-        (entry): entry is PersistedWorkboardCard => entry?.version === 1 && Boolean(entry.card?.id),
-      )
-      .map((entry) => entry.card)
-      .filter((card) => !boardId || cardBoardId(card) === boardId)
-      .toSorted(compareCards);
+    return (
+      entries
+        .map((entry) => entry.value)
+        .filter(
+          (entry): entry is PersistedWorkboardCard =>
+            entry?.version === 1 && Boolean(entry.card?.id),
+        )
+        .map((entry) => entry.card)
+        .filter((card) => !boardId || cardBoardId(card) === boardId)
+        // No labels requested means no filtering: every() is true for an empty
+        // list, which is exactly the opt-in behavior existing callers rely on.
+        .filter((card) => labels.every((label) => (card.labels ?? []).includes(label)))
+        .toSorted(compareCards)
+    );
   }
 
   async listBoards(): Promise<{ boards: WorkboardBoardSummary[] }> {

@@ -117,6 +117,9 @@ function hasConfiguredRemoteGatewayTarget(): boolean {
   }
 }
 
+/** Local `openclaw workboard ...` invocation; no gateway connection to read. */
+const CLI_ACTOR = "cli:workboard";
+
 export function registerWorkboardCli(params: { program: Command; store: WorkboardStore }): void {
   const workboard = params.program
     .command("workboard")
@@ -186,15 +189,23 @@ export function registerWorkboardCli(params: { program: Command; store: Workboar
           labels?: string;
         },
       ) => {
-        const card = await params.store.create({
-          title: title.join(" "),
-          notes: options.notes,
-          status: options.status,
-          priority: options.priority,
-          agentId: options.agent,
-          boardId: options.board,
-          labels: splitLabels(options.labels),
-        });
+        // The CLI mutates the store DIRECTLY — it never reaches the gateway
+        // handler that derives an actor from the connection — so `workboard
+        // create` was the one remaining writer producing unattributed events
+        // after the gateway surface was covered.
+        const card = await params.store.create(
+          {
+            title: title.join(" "),
+            notes: options.notes,
+            status: options.status,
+            priority: options.priority,
+            agentId: options.agent,
+            boardId: options.board,
+            labels: splitLabels(options.labels),
+          },
+          undefined,
+          CLI_ACTOR,
+        );
         if (options.json) {
           writeJson({ card: redactClaimToken(card) });
         } else {

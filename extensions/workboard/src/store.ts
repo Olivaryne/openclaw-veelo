@@ -98,6 +98,71 @@ export type {
   WorkboardKeyedStore,
 } from "./persistence-types.js";
 
+/*
+ * The evidence gate, applied to DIRECT status changes.
+ *
+ * `workboard_complete` has been gated since 2026-08-04 (see tools.ts), but that
+ * gate protected exactly one door. `workboard.cards.move` and
+ * `workboard.cards.update` both accept a status and both reach `done`, and
+ * neither touched the policy — so a card could be closed with zero evidence by
+ * asking for the status directly instead of completing.
+ *
+ * That is not hypothetical. On 2026-08-07, cards fa25e94f (VLR-009) and
+ * 339d955d moved review -> done with no passing proof; the dispatch sweeper
+ * flagged both as `done-without-proof` afterwards. VLR-009's own last comment
+ * read "Remains blocked (dependency)". 74 proofless done cards had accumulated
+ * on the same board.
+ *
+ * The predicate matches the sweeper's, so the gate refuses exactly what the
+ * sweeper would otherwise report after the fact: a proof ARRAY is not proof —
+ * an entry must be `passed`. Artifacts and attachments count on their own,
+ * being work product rather than a claim about it.
+ *
+ * Placement is the PUBLIC `update()`, not the private `updateCard()`.
+ * `completeDirect` goes through the private path with evidence it has already
+ * validated, and internal transitions (dependency promotion, claim expiry)
+ * must not be gated on work product. Everything a caller can reach from the
+ * gateway goes through the public method, which is already where
+ * external-caller policy lives (`enforceStatusHolds: true`).
+ */
+const EVIDENCE_GATED_STATUSES = new Set(["done"]);
+
+export function requireProofMode(env: NodeJS.ProcessEnv = process.env): "enforce" | "warn" | "off" {
+  const raw = (env.OPENCLAW_WORKBOARD_REQUIRE_PROOF ?? "enforce").toLowerCase();
+  // Unrecognized values resolve to `enforce`, never the loosest mode — same
+  // reasoning as tools.ts: a typo must not quietly reopen the door.
+  return raw === "off" || raw === "warn" ? raw : "enforce";
+}
+
+/** Mirrors dispatch_sweep's done-without-proof predicate. */
+function hasPassingEvidence(card: WorkboardCard | null | undefined): boolean {
+  const meta = card?.metadata;
+  if (!meta) {
+    return false;
+  }
+  const passing =
+    Array.isArray(meta.proof) &&
+    meta.proof.some((p) => p && typeof p === "object" && p.status === "passed");
+  return (
+    passing ||
+    Boolean(Array.isArray(meta.artifacts) && meta.artifacts.length) ||
+    Boolean(Array.isArray(meta.attachments) && meta.attachments.length)
+  );
+}
+
+function directCloseRefusal(id: string, status: string): Error {
+  const short = id.slice(0, 8);
+  return new Error(
+    `refusing to set card ${id} to "${status}" — the card carries no passing evidence. ` +
+      "A direct status change is not a completion. Use ONE of:\n" +
+      `  workboard_complete with proof: { command: "<the exact command you ran> # card ${short}" }\n` +
+      '  workboard_complete with proof: { url: "<PR or CI url>" }\n' +
+      '  workboard_complete with noProofReason: "<why there is no command or url>"\n' +
+      "  gateway call workboard.cards.proof to attach evidence first, then move the card.\n" +
+      "Set OPENCLAW_WORKBOARD_REQUIRE_PROOF=warn to allow direct closes and record the gap instead.",
+  );
+}
+
 const POSITION_STEP = 1000;
 const MAX_CARDS = 2000;
 const MAX_CARD_EVENTS = 50;
@@ -3673,6 +3738,10 @@ export class WorkboardStore {
         await this.updateCard(id, patch, {
           allowMetadataDependencyLinks: false,
           enforceStatusHolds: true,
+          // See EVIDENCE_GATED_STATUSES. Only the PUBLIC entry point sets this:
+          // completeDirect and internal transitions use updateCard directly and
+          // must not be gated on work product.
+          enforceEvidenceOnClose: true,
         }),
     );
   }
@@ -3680,7 +3749,11 @@ export class WorkboardStore {
   private async updateCard(
     id: string,
     patch: WorkboardCardPatch,
-    options: { allowMetadataDependencyLinks?: boolean; enforceStatusHolds?: boolean } = {},
+    options: {
+      allowMetadataDependencyLinks?: boolean;
+      enforceStatusHolds?: boolean;
+      enforceEvidenceOnClose?: boolean;
+    } = {},
   ): Promise<WorkboardCard> {
     const existing = await this.get(id);
     if (!existing) {
@@ -3817,6 +3890,22 @@ export class WorkboardStore {
     next.events = appendEvent(next, updateEvent(existing, next), now);
     if (options.enforceStatusHolds && effectivePatch.status !== undefined) {
       await this.assertActiveStatusAllowed(existing, next, now);
+    }
+    /*
+     * The evidence gate runs AFTER the dependency/hold check on purpose. A card
+     * held by unfinished parents must report that, not a misleading "no
+     * evidence" — the dependency is the more fundamental reason the transition
+     * is illegal, and masking it sends the caller to attach proof for a move
+     * that would be refused anyway.
+     */
+    if (
+      options.enforceEvidenceOnClose &&
+      EVIDENCE_GATED_STATUSES.has(next.status) &&
+      existing.status !== next.status &&
+      requireProofMode() === "enforce" &&
+      !hasPassingEvidence(existing)
+    ) {
+      throw directCloseRefusal(existing.id, next.status);
     }
     if (status !== "done") {
       delete next.completedAt;

@@ -9,6 +9,7 @@ import type { OpenClawPluginApi } from "../api.js";
 import { registerWorkboardGatewayMethods } from "./gateway.js";
 import { createWorkboardSqliteStores } from "./sqlite-store.js";
 import {
+  requireProofMode,
   WorkboardStore,
   type PersistedWorkboardAttachment,
   type PersistedWorkboardBoard,
@@ -195,6 +196,110 @@ describe("WorkboardStore", () => {
     expect(review.labels).toEqual(["release", "docs"]);
     expect(review.priority).toBe("high");
     expect(review.events?.[0]).toMatchObject({ kind: "created", toStatus: "review" });
+  });
+
+  describe("the evidence gate on direct status changes", () => {
+    /*
+     * workboard_complete has been gated since 2026-08-04, but that protected
+     * one door. move() and update() both accept a status and both reach
+     * `done`, so a card could be closed with zero evidence by asking for the
+     * status instead of completing. Observed live 2026-08-07: two cards moved
+     * review -> done with no passing proof, one of whose own last comment read
+     * "Remains blocked (dependency)".
+     */
+    it("refuses move() to done on a card with no passing evidence", async () => {
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "no proof", status: "review" });
+      await expect(store.move(card.id, "done", undefined)).rejects.toThrow(/no passing evidence/);
+      expect((await store.get(card.id))?.status).toBe("review");
+    });
+
+    it("refuses update({status:'done'}) too — the same door by another name", async () => {
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "no proof", status: "review" });
+      await expect(store.update(card.id, { status: "done" })).rejects.toThrow(
+        /no passing evidence/,
+      );
+      expect((await store.get(card.id))?.status).toBe("review");
+    });
+
+    it("allows the move once the card carries PASSING proof", async () => {
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "proven", status: "review" });
+      await store.complete(card.id, {
+        summary: "did the thing",
+        proof: { status: "passed", label: "suite", command: "npm test" },
+      });
+      // complete() already lands it in done; move it out and back to prove the
+      // gate reads the card's evidence rather than the completion call.
+      await store.move(card.id, "review", undefined);
+      await expect(store.move(card.id, "done", undefined)).resolves.toBeTruthy();
+      expect((await store.get(card.id))?.status).toBe("done");
+    });
+
+    it("a proof ARRAY is not proof — an entry must be passed", async () => {
+      // Mirrors dispatch_sweep: the closer writes an `unknown` entry on every
+      // auto-completion, so counting entries would clear the check for exactly
+      // the cards it exists to catch.
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "unknown proof", status: "review" });
+      await store.addProof(card.id, { status: "unknown", label: "tried", note: "no artifact" });
+      expect((await store.get(card.id))?.metadata?.proof).toHaveLength(1);
+      await expect(store.move(card.id, "done", undefined)).rejects.toThrow(/no passing evidence/);
+    });
+
+    it("artifacts and attachments count on their own", async () => {
+      // Work product, not a claim about it.
+      const store = new WorkboardStore(createMemoryStore());
+      const a = await store.create({ title: "artifact", status: "review" });
+      await store.addProofWithArtifact(
+        a.id,
+        { status: "unknown", label: "render" },
+        { path: "out/report.html", label: "report" },
+      );
+      expect((await store.get(a.id))?.metadata?.artifacts?.length).toBeGreaterThan(0);
+      await expect(store.move(a.id, "done", undefined)).resolves.toBeTruthy();
+    });
+
+    it("does NOT gate complete() — it validates its own evidence", async () => {
+      // The gate lives on the PUBLIC update(); completeDirect uses the private
+      // path. Gating there would break the one door that was already correct.
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "completes", status: "running" });
+      await expect(
+        store.complete(card.id, { summary: "read-only investigation, no artifact" }),
+      ).resolves.toBeTruthy();
+      expect((await store.get(card.id))?.status).toBe("done");
+    });
+
+    it("does not refuse a card that is ALREADY done", async () => {
+      // Repositioning or re-saving a closed card is not a close.
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "already", status: "review" });
+      await store.complete(card.id, { summary: "x" });
+      await expect(store.move(card.id, "done", 1234)).resolves.toBeTruthy();
+    });
+
+    it("non-terminal transitions are never gated", async () => {
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "moves freely", status: "todo" });
+      for (const s of ["ready", "running", "review", "blocked"]) {
+        await expect(store.move(card.id, s, undefined)).resolves.toBeTruthy();
+      }
+    });
+
+    it("mode parsing: off and warn are honoured, anything else is enforce", () => {
+      // Tested as a pure function with an injected env rather than by mutating
+      // process.env: these files can share a worker, and a global mutation here
+      // leaked into the sqlite-store suite and failed an unrelated
+      // AUT-WB-ATOMIC reservation test.
+      expect(requireProofMode({ OPENCLAW_WORKBOARD_REQUIRE_PROOF: "off" })).toBe("off");
+      expect(requireProofMode({ OPENCLAW_WORKBOARD_REQUIRE_PROOF: "warn" })).toBe("warn");
+      expect(requireProofMode({ OPENCLAW_WORKBOARD_REQUIRE_PROOF: "ENFORCE" })).toBe("enforce");
+      expect(requireProofMode({})).toBe("enforce");
+      // A typo must not quietly reopen the door.
+      expect(requireProofMode({ OPENCLAW_WORKBOARD_REQUIRE_PROOF: "offf" })).toBe("enforce");
+    });
   });
 
   it("filters by label, requiring ALL of them", async () => {
@@ -408,6 +513,11 @@ describe("WorkboardStore", () => {
       toStatus: "running",
     });
 
+    // Evidence first: a direct status change to `done` is gated (see
+    // EVIDENCE_GATED_STATUSES). The subject of this test is the timestamp
+    // bookkeeping, not the gate, so the card is given real proof rather than
+    // the gate being weakened for it.
+    await store.addProof(card.id, { status: "passed", label: "suite", command: "npm test" });
     const done = await store.update(card.id, { status: "done" });
     expect(done.completedAt).toBeGreaterThanOrEqual(done.startedAt ?? 0);
 

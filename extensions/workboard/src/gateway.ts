@@ -287,9 +287,9 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.claim",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
-        const claimed = await store.claim(readId(requestParams), requestParams);
+        const claimed = await store.claim(readId(requestParams), requestParams, actorOf(client));
         respond(true, { ...claimed, card: redactClaimToken(claimed.card) });
       } catch (error) {
         respondError(respond, error);
@@ -386,10 +386,12 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.block",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
         respond(true, {
-          card: redactClaimToken(await store.block(readId(requestParams), requestParams, null)),
+          card: redactClaimToken(
+            await store.block(readId(requestParams), requestParams, null, actorOf(client)),
+          ),
         });
       } catch (error) {
         respondError(respond, error);
@@ -400,10 +402,12 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.unblock",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
         respond(true, {
-          card: redactClaimToken(await store.unblock(readId(requestParams))),
+          card: redactClaimToken(
+            await store.unblock(readId(requestParams), undefined, actorOf(client)),
+          ),
         });
       } catch (error) {
         respondError(respond, error);

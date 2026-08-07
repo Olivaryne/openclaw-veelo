@@ -347,6 +347,59 @@ describe("WorkboardStore", () => {
         fs.rmSync(dir, { recursive: true, force: true });
       }
     });
+    it("attributes claim, block, unblock and the artifact writers", async () => {
+      /*
+       * The last mutating methods. claim() writes TWO events — the claim and
+       * the move to running — and both carry the actor: attributing only one
+       * would leave the status change looking spontaneous.
+       *
+       * addProofWithArtifact and addArtifact were found by auditing every
+       * `async` mutator against the actor param rather than by working from the
+       * incident, which is how addProof's sibling had been missed.
+       */
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-actor3-"));
+      const dbPath = path.join(dir, "workboard.sqlite");
+      try {
+        const first = createWorkboardSqliteStores({ dbPath });
+        const store = new WorkboardStore(first.cards, {
+          boards: first.boards,
+          subscriptions: first.subscriptions,
+          attachments: first.attachments,
+        });
+        const card = await store.create({ title: "lifecycle", status: "ready" });
+        const { token } = await store.claim(card.id, { ownerId: "picus" }, "agent:picus/s1");
+        await store.addArtifact(
+          card.id,
+          { path: "out/x.html" },
+          { ownerId: "picus", token },
+          "agent:picus/s2",
+        );
+        await store.block(
+          card.id,
+          { reason: "waiting on upstream" },
+          { ownerId: "picus", token },
+          "agent:picus/s3",
+        );
+        await store.unblock(card.id, undefined, "client:control-ui/ui");
+
+        const second = createWorkboardSqliteStores({ dbPath });
+        const reopened = new WorkboardStore(second.cards, {
+          boards: second.boards,
+          subscriptions: second.subscriptions,
+          attachments: second.attachments,
+        });
+        const events = (await reopened.get(card.id))?.events ?? [];
+        const actors = events.filter((e) => e.actor).map((e) => e.actor);
+        // claim contributes two attributed events (claimed + moved to running).
+        expect(actors.filter((a) => a === "agent:picus/s1")).toHaveLength(2);
+        expect(actors).toContain("agent:picus/s2");
+        expect(actors).toContain("agent:picus/s3");
+        expect(actors).toContain("client:control-ui/ui");
+        expect((await reopened.get(card.id))?.status).toBe("todo");
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("the evidence gate on direct status changes", () => {

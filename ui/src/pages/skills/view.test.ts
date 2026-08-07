@@ -203,7 +203,15 @@ describe("renderSkills", () => {
     expect(updatedToggles[0].checked).toBe(false);
   });
 
-  it("treats skills blocked by the selected agent filter as needing setup", async () => {
+  it("reports agent-filtered skills as Excluded, not Needs Setup", async () => {
+    /*
+     * "Needs setup" tells the operator to go configure something. An
+     * agent-filtered skill needs no configuration — it is simply absent from
+     * that agent's `skills` allowlist, and its `missing` requirements are
+     * empty. The CLI has always separated these (`formatSkillStatus` prints
+     * "excluded" vs "needs setup"); the dashboard folded them together and sent
+     * operators looking for work that did not exist.
+     */
     const container = document.createElement("div");
     document.body.append(container);
     dialogRestores.push(() => container.remove());
@@ -221,19 +229,41 @@ describe("renderSkills", () => {
 
     expect(container.querySelectorAll(".list-item")).toHaveLength(0);
     expect(normalizeText(container)).toContain("Ready0");
-    expect(normalizeText(container)).toContain("Needs Setup1");
+    expect(normalizeText(container)).toContain("Needs Setup0");
+    expect(normalizeText(container)).toContain("Excluded1");
 
     render(
-      renderSkills(createProps({ report, statusFilter: "needs-setup", detailKey: "repo-skill" })),
+      renderSkills(createProps({ report, statusFilter: "excluded", detailKey: "repo-skill" })),
       container,
     );
     await Promise.resolve();
 
+    expect(container.querySelectorAll(".list-item")).toHaveLength(1);
     expect(container.querySelector(".list-item .statusDot")?.classList.contains("warn")).toBe(true);
     expect(normalizeText(container)).toContain("Reason: blocked by agent filter");
     expect(
       Array.from(container.querySelectorAll(".chip")).map((chip) => normalizeText(chip)),
     ).toContain("blocked");
+  });
+
+  it("keeps Needs Setup for a skill with genuinely unmet requirements", async () => {
+    // The bucket must still exist and still mean what it says: not eligible,
+    // but nothing is excluding it either — a real operator chore.
+    const container = document.createElement("div");
+    document.body.append(container);
+    dialogRestores.push(() => container.remove());
+    const report: SkillStatusReport = {
+      workspaceDir: "/tmp/workspace",
+      managedSkillsDir: "/tmp/skills",
+      skills: [createSkill({ eligible: false })],
+    };
+
+    render(renderSkills(createProps({ report, statusFilter: "needs-setup" })), container);
+    await Promise.resolve();
+
+    expect(container.querySelectorAll(".list-item")).toHaveLength(1);
+    expect(normalizeText(container)).toContain("Needs Setup1");
+    expect(normalizeText(container)).toContain("Excluded0");
   });
 
   it("defers detail dialog opening until the dialog is connected", async () => {

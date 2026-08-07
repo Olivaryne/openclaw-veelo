@@ -46,7 +46,7 @@ function showDialogWhenClosed(el?: Element) {
   }
 }
 
-export type SkillsStatusFilter = "all" | "ready" | "needs-setup" | "disabled";
+export type SkillsStatusFilter = "all" | "ready" | "needs-setup" | "excluded" | "disabled";
 export type SkillDetailTab = "overview" | "card";
 
 type SkillsProps = {
@@ -108,17 +108,33 @@ const STATUS_TABS: StatusTabDef[] = [
   { id: "all", label: "All" },
   { id: "ready", label: "Ready" },
   { id: "needs-setup", label: "Needs Setup" },
+  { id: "excluded", label: "Excluded" },
   { id: "disabled", label: "Disabled" },
 ];
 
+/**
+ * Mirrors the four states `formatSkillStatus` prints in the CLI
+ * (`src/cli/skills-cli.format.ts`): disabled, blocked/excluded, ready, needs
+ * setup. "Excluded" previously fell into "Needs Setup", which told the operator
+ * to go configure something that needs no configuration: an agent-filtered
+ * skill is simply absent from that agent's `skills` allowlist, and its
+ * `missing` requirements are empty.
+ */
 function skillMatchesStatus(skill: SkillStatusEntry, status: SkillsStatusFilter): boolean {
   switch (status) {
     case "all":
       return true;
     case "ready":
       return !skill.disabled && isSkillAvailable(skill);
+    case "excluded":
+      return !skill.disabled && (skill.blockedByAgentFilter || skill.blockedByAllowlist);
     case "needs-setup":
-      return !skill.disabled && !isSkillAvailable(skill);
+      return (
+        !skill.disabled &&
+        !skill.blockedByAgentFilter &&
+        !skill.blockedByAllowlist &&
+        !skill.eligible
+      );
     case "disabled":
       return skill.disabled;
   }
@@ -196,13 +212,18 @@ export function renderSkills(props: SkillsProps) {
     all: skills.length,
     ready: 0,
     "needs-setup": 0,
+    excluded: 0,
     disabled: 0,
   };
+  // Same order as skillMatchesStatus, so a tab's count always equals the number
+  // of rows that tab shows.
   for (const s of skills) {
     if (s.disabled) {
       statusCounts.disabled++;
     } else if (isSkillAvailable(s)) {
       statusCounts.ready++;
+    } else if (s.blockedByAgentFilter || s.blockedByAllowlist) {
+      statusCounts.excluded++;
     } else {
       statusCounts["needs-setup"]++;
     }

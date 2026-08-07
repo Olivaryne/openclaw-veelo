@@ -110,6 +110,17 @@ export type WorkboardEvent = {
   toStatus?: WorkboardStatus;
   sessionKey?: string;
   runId?: string;
+  /**
+   * Who caused this event, as reported by the gateway connection.
+   *
+   * Absent before 2026-08-07 and still absent for internal transitions, so a
+   * missing value means "not attributed", never "nobody". Added after 29 cards
+   * were archived and 2 were closed without evidence by a caller that could not
+   * be identified afterwards: the events recorded what happened and when, but
+   * nothing recorded who, so the incident cost an hour of elimination and still
+   * ended unattributed.
+   */
+  actor?: string;
 };
 
 export type WorkboardRunAttempt = {

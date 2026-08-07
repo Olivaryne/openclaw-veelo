@@ -298,6 +298,55 @@ describe("WorkboardStore", () => {
         fs.rmSync(dir, { recursive: true, force: true });
       }
     });
+    it("attributes create, comment, proof and complete as well", async () => {
+      /*
+       * The first pass wired only the three mutations from the 2026-08-07
+       * incident. Partial attribution is the same failure shape as gating one
+       * door: whatever is left unattributed becomes where the next unexplained
+       * change hides. SQLite-backed and reopened, because the in-memory store
+       * cannot prove persistence (see the previous test).
+       */
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-actor2-"));
+      const dbPath = path.join(dir, "workboard.sqlite");
+      try {
+        const first = createWorkboardSqliteStores({ dbPath });
+        const store = new WorkboardStore(first.cards, {
+          boards: first.boards,
+          subscriptions: first.subscriptions,
+          attachments: first.attachments,
+        });
+        const card = await store.create(
+          { title: "fully attributed", status: "running" },
+          undefined,
+          "agent:aquila/s1",
+        );
+        await store.addComment(card.id, { body: "looked into it" }, undefined, "agent:milvus/s2");
+        await store.addProof(
+          card.id,
+          { status: "passed", label: "suite", command: "npm test" },
+          undefined,
+          "agent:picus/s3",
+        );
+        await store.complete(card.id, { summary: "done" }, null, "client:control-ui/ui");
+
+        const second = createWorkboardSqliteStores({ dbPath });
+        const reopened = new WorkboardStore(second.cards, {
+          boards: second.boards,
+          subscriptions: second.subscriptions,
+          attachments: second.attachments,
+        });
+        const events = (await reopened.get(card.id))?.events ?? [];
+        const actorFor = (kind: string) => events.find((e) => e.kind === kind)?.actor;
+        expect(actorFor("created")).toBe("agent:aquila/s1");
+        expect(actorFor("comment_added")).toBe("agent:milvus/s2");
+        expect(actorFor("proof_added")).toBe("agent:picus/s3");
+        // complete() lands the card in done; that transition is a `moved` event.
+        expect(events.at(-1)?.actor).toBe("client:control-ui/ui");
+        expect((await reopened.get(card.id))?.status).toBe("done");
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("the evidence gate on direct status changes", () => {

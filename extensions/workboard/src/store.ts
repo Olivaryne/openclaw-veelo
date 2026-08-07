@@ -3602,13 +3602,15 @@ export class WorkboardStore {
   async create(
     input: WorkboardLinkedCreateInput,
     scope?: WorkboardMutationScope,
+    actor?: string,
   ): Promise<WorkboardCard> {
-    return await this.enqueueMutation(async () => await this.createDirect(input, scope));
+    return await this.enqueueMutation(async () => await this.createDirect(input, scope, actor));
   }
 
   private async createDirect(
     input: WorkboardLinkedCreateInput,
     scope?: WorkboardMutationScope,
+    actor?: string,
   ): Promise<WorkboardCard> {
     const now = Date.now();
     const requestedStatus = normalizeStatus(input.status, "todo");
@@ -3719,6 +3721,7 @@ export class WorkboardStore {
           toStatus: status,
           ...(sessionKey ? { sessionKey } : {}),
           ...(runId ? { runId } : {}),
+          ...(clampActor(actor) ? { actor: clampActor(actor) } : {}),
         },
       ],
       ...(notes ? { notes } : {}),
@@ -4309,6 +4312,7 @@ export class WorkboardStore {
     id: string,
     input: WorkboardCommentInput,
     scope?: WorkboardMutationScope,
+    actor?: string,
   ): Promise<WorkboardCard> {
     const now = Date.now();
     const body = normalizeBoundedString(input.body, undefined, 2000, "comment body");
@@ -4316,13 +4320,17 @@ export class WorkboardStore {
       throw new Error("comment body is required.");
     }
     const comment = { id: randomUUID(), body, createdAt: now };
-    return await this.updateMetadata(id, (existing) => {
-      assertCanMutateClaimedCard(existing, scope);
-      return {
-        ...existing.metadata,
-        comments: [...(existing.metadata?.comments ?? []), comment].slice(-MAX_CARD_COMMENTS),
-      };
-    });
+    return await this.updateMetadata(
+      id,
+      (existing) => {
+        assertCanMutateClaimedCard(existing, scope);
+        return {
+          ...existing.metadata,
+          comments: [...(existing.metadata?.comments ?? []), comment].slice(-MAX_CARD_COMMENTS),
+        };
+      },
+      actor,
+    );
   }
 
   async addLink(id: string, input: WorkboardLinkInput): Promise<WorkboardCard> {
@@ -4576,17 +4584,22 @@ export class WorkboardStore {
     id: string,
     input: WorkboardProofInput,
     scope?: WorkboardMutationScope,
+    actor?: string,
   ): Promise<WorkboardCard> {
     const now = Date.now();
     const proof = normalizeProofInput(input, now);
-    return await this.updateMetadata(id, (existing) => {
-      assertCanMutateClaimedCard(existing, scope);
-      const metadata = clearDiagnostics(existing.metadata, ["missing_proof"]);
-      return {
-        ...metadata,
-        proof: [...(metadata.proof ?? []), proof].slice(-MAX_CARD_PROOF),
-      };
-    });
+    return await this.updateMetadata(
+      id,
+      (existing) => {
+        assertCanMutateClaimedCard(existing, scope);
+        const metadata = clearDiagnostics(existing.metadata, ["missing_proof"]);
+        return {
+          ...metadata,
+          proof: [...(metadata.proof ?? []), proof].slice(-MAX_CARD_PROOF),
+        };
+      },
+      actor,
+    );
   }
 
   async addProofWithArtifact(
@@ -4944,14 +4957,18 @@ export class WorkboardStore {
     id: string,
     input: WorkboardCompleteInput = {},
     scope: WorkboardMutationScope | null | undefined = input,
+    actor?: string,
   ): Promise<WorkboardCard> {
-    return await this.enqueueMutation(async () => await this.completeDirect(id, input, scope));
+    return await this.enqueueMutation(
+      async () => await this.completeDirect(id, input, scope, actor),
+    );
   }
 
   private async completeDirect(
     id: string,
     input: WorkboardCompleteInput = {},
     scope: WorkboardMutationScope | null | undefined = input,
+    actor?: string,
   ): Promise<WorkboardCard> {
     const existing = await this.get(id);
     if (!existing) {
@@ -5031,7 +5048,7 @@ export class WorkboardStore {
           ),
         },
       },
-      { enforceStatusHolds: true },
+      { enforceStatusHolds: true, ...(actor ? { actor } : {}) },
     );
   }
 

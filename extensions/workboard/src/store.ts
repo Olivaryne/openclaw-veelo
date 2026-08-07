@@ -4607,6 +4607,7 @@ export class WorkboardStore {
     proofInput: WorkboardProofInput,
     artifactInput: WorkboardArtifactInput,
     scope?: WorkboardMutationScope,
+    actor?: string,
   ): Promise<WorkboardCard> {
     const now = Date.now();
     const proof = normalizeProofInput(proofInput, now);
@@ -4614,34 +4615,43 @@ export class WorkboardStore {
     if (!artifact) {
       throw new Error("artifact url or path is required.");
     }
-    return await this.updateMetadata(id, (existing) => {
-      assertCanMutateClaimedCard(existing, scope);
-      const metadata = clearDiagnostics(existing.metadata, ["missing_proof"]);
-      return {
-        ...metadata,
-        proof: [...(metadata.proof ?? []), proof].slice(-MAX_CARD_PROOF),
-        artifacts: [...(metadata.artifacts ?? []), artifact].slice(-MAX_CARD_ARTIFACTS),
-      };
-    });
+    return await this.updateMetadata(
+      id,
+      (existing) => {
+        assertCanMutateClaimedCard(existing, scope);
+        const metadata = clearDiagnostics(existing.metadata, ["missing_proof"]);
+        return {
+          ...metadata,
+          proof: [...(metadata.proof ?? []), proof].slice(-MAX_CARD_PROOF),
+          artifacts: [...(metadata.artifacts ?? []), artifact].slice(-MAX_CARD_ARTIFACTS),
+        };
+      },
+      actor,
+    );
   }
 
   async addArtifact(
     id: string,
     input: WorkboardArtifactInput,
     scope?: WorkboardMutationScope,
+    actor?: string,
   ): Promise<WorkboardCard> {
     const artifact = normalizeArtifact({ ...input, createdAt: Date.now() });
     if (!artifact) {
       throw new Error("artifact url or path is required.");
     }
-    return await this.updateMetadata(id, (existing) => {
-      assertCanMutateClaimedCard(existing, scope);
-      const metadata = clearDiagnostics(existing.metadata, ["missing_proof"]);
-      return {
-        ...metadata,
-        artifacts: [...(metadata.artifacts ?? []), artifact].slice(-MAX_CARD_ARTIFACTS),
-      };
-    });
+    return await this.updateMetadata(
+      id,
+      (existing) => {
+        assertCanMutateClaimedCard(existing, scope);
+        const metadata = clearDiagnostics(existing.metadata, ["missing_proof"]);
+        return {
+          ...metadata,
+          artifacts: [...(metadata.artifacts ?? []), artifact].slice(-MAX_CARD_ARTIFACTS),
+        };
+      },
+      actor,
+    );
   }
 
   async addAttachment(
@@ -4824,6 +4834,7 @@ export class WorkboardStore {
   async claim(
     id: string,
     input: WorkboardClaimInput,
+    actor?: string,
   ): Promise<{ card: WorkboardCard; token: string }> {
     const ownerId = normalizeBoundedString(input.ownerId, undefined, 120, "claim owner");
     if (!ownerId) {
@@ -4856,19 +4867,30 @@ export class WorkboardStore {
         throw new Error(`card already claimed by ${existingClaim.ownerId}.`);
       }
       const metadata = clearDiagnostics(guarded.metadata, ["stranded_ready"]);
-      const card = await this.updateCard(id, {
-        metadata: {
-          ...metadata,
-          claim: { ownerId, token, claimedAt: now, lastHeartbeatAt: now, expiresAt },
+      // Two events: the claim, then the move to running. Both are the same
+      // caller, so both carry the actor — attributing only one would leave the
+      // status change looking spontaneous.
+      const card = await this.updateCard(
+        id,
+        {
+          metadata: {
+            ...metadata,
+            claim: { ownerId, token, claimedAt: now, lastHeartbeatAt: now, expiresAt },
+          },
         },
-      });
-      const next = await this.updateCard(card.id, {
-        status:
-          card.status === "backlog" || card.status === "todo" || card.status === "ready"
-            ? "running"
-            : card.status,
-        agentId: card.agentId ?? ownerId,
-      });
+        actor ? { actor } : {},
+      );
+      const next = await this.updateCard(
+        card.id,
+        {
+          status:
+            card.status === "backlog" || card.status === "todo" || card.status === "ready"
+              ? "running"
+              : card.status,
+          agentId: card.agentId ?? ownerId,
+        },
+        actor ? { actor } : {},
+      );
       return { card: next, token };
     });
   }
@@ -5056,6 +5078,7 @@ export class WorkboardStore {
     id: string,
     input: WorkboardBlockInput = {},
     scope: WorkboardMutationScope | null | undefined = input,
+    actor?: string,
   ): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
       const existing = await this.get(id);
@@ -5081,27 +5104,35 @@ export class WorkboardStore {
         existing.execution?.status === "running"
           ? { ...existing.execution, status: "blocked" as const, updatedAt: now }
           : existing.execution;
-      return await this.updateCard(id, {
-        status: "blocked",
-        ...(execution ? { execution } : {}),
-        metadata: {
-          ...metadata,
-          claim: undefined,
-          attempts: closeRunningAttempts(metadata.attempts, now, "blocked", reason),
-          failureCount: (metadata.failureCount ?? 0) + 1,
-          comments: [
-            ...(metadata.comments ?? []),
-            { id: randomUUID(), body: reason, createdAt: now },
-          ].slice(-MAX_CARD_COMMENTS),
-          notifications: [...(metadata.notifications ?? []), notification].slice(
-            -MAX_CARD_NOTIFICATIONS,
-          ),
+      return await this.updateCard(
+        id,
+        {
+          status: "blocked",
+          ...(execution ? { execution } : {}),
+          metadata: {
+            ...metadata,
+            claim: undefined,
+            attempts: closeRunningAttempts(metadata.attempts, now, "blocked", reason),
+            failureCount: (metadata.failureCount ?? 0) + 1,
+            comments: [
+              ...(metadata.comments ?? []),
+              { id: randomUUID(), body: reason, createdAt: now },
+            ].slice(-MAX_CARD_COMMENTS),
+            notifications: [...(metadata.notifications ?? []), notification].slice(
+              -MAX_CARD_NOTIFICATIONS,
+            ),
+          },
         },
-      });
+        actor ? { actor } : {},
+      );
     });
   }
 
-  async unblock(id: string, scope?: WorkboardMutationScope): Promise<WorkboardCard> {
+  async unblock(
+    id: string,
+    scope?: WorkboardMutationScope,
+    actor?: string,
+  ): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
       const existing = await this.get(id);
       if (!existing) {
@@ -5109,7 +5140,11 @@ export class WorkboardStore {
       }
       assertCanMutateClaimedCard(existing, scope);
       const metadata = clearDiagnostics(existing.metadata, ["blocked_too_long"]);
-      return await this.updateCard(id, { status: "todo", metadata: { ...metadata, stale: null } });
+      return await this.updateCard(
+        id,
+        { status: "todo", metadata: { ...metadata, stale: null } },
+        actor ? { actor } : {},
+      );
     });
   }
 

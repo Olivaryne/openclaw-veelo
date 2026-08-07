@@ -253,7 +253,8 @@ function ensureWorkboardSchema(db: DatabaseSync): void {
       from_status TEXT,
       to_status TEXT,
       session_key TEXT,
-      run_id TEXT
+      run_id TEXT,
+      actor TEXT
     );
 
     CREATE TABLE IF NOT EXISTS workboard_card_attempts (
@@ -398,6 +399,11 @@ function ensureWorkboardSchema(db: DatabaseSync): void {
     "lifecycle_status_source_updated_at",
     "lifecycle_status_source_updated_at INTEGER",
   );
+  // Attribution (2026-08-07). Additive and idempotent: existing rows keep a NULL
+  // actor, which reads as "not attributed" rather than a claim about who acted.
+  // No migration ledger id — this table is not one of the schema-4 objects the
+  // OT-GOV-4 exact-DDL check verifies.
+  ensureColumn(db, "workboard_card_events", "actor", "actor TEXT");
   db.prepare(
     "INSERT OR IGNORE INTO workboard_schema_migrations (id, applied_at) VALUES (?, ?)",
   ).run(BASE_SCHEMA_MIGRATION_ID, Date.now());
@@ -1066,6 +1072,10 @@ function readEvents(db: DatabaseSync, cardId: string): WorkboardEvent[] | undefi
     const toStatus = stringValue(row, "to_status");
     const sessionKey = stringValue(row, "session_key");
     const runId = stringValue(row, "run_id");
+    const actor = stringValue(row, "actor");
+    if (actor) {
+      event.actor = actor;
+    }
     if (fromStatus) {
       event.fromStatus = fromStatus as WorkboardEvent["fromStatus"];
     }
@@ -1495,8 +1505,8 @@ function insertCard(db: DatabaseSync, card: WorkboardCard): void {
     db.prepare(
       `
         INSERT INTO workboard_card_events
-          (id, card_id, ordinal, kind, at, from_status, to_status, session_key, run_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, card_id, ordinal, kind, at, from_status, to_status, session_key, run_id, actor)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     ).run(
       event.id,
@@ -1508,6 +1518,7 @@ function insertCard(db: DatabaseSync, card: WorkboardCard): void {
       bindNull(event.toStatus),
       bindNull(event.sessionKey),
       bindNull(event.runId),
+      bindNull(event.actor),
     );
   });
   insertChildren(db, "workboard_card_attempts", card.id, metadata?.attempts, (entry, ordinal) => {

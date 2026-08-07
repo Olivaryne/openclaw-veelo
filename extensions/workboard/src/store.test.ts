@@ -258,6 +258,46 @@ describe("WorkboardStore", () => {
       const actor = (await store.get(card.id))?.events?.at(-1)?.actor ?? "";
       expect(actor.length).toBeLessThanOrEqual(200);
     });
+    it("persists the actor to SQLITE, not just to memory", async () => {
+      /*
+       * The gap that made the first version of this feature useless. Events do
+       * not live on the card JSON — they are rows in workboard_card_events with
+       * explicit columns, so a field added only to the type is written by the
+       * in-memory store and silently dropped by the real one. Every unit test
+       * here used createMemoryStore and passed while the live gateway recorded
+       * nothing. This test uses the SQLite store on purpose, and reopens the
+       * database so the value has to survive a real write/read cycle.
+       */
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-actor-"));
+      const dbPath = path.join(dir, "workboard.sqlite");
+      try {
+        const first = createWorkboardSqliteStores({ dbPath });
+        const store = new WorkboardStore(first.cards, {
+          boards: first.boards,
+          subscriptions: first.subscriptions,
+          attachments: first.attachments,
+        });
+        const card = await store.create({ title: "attributed", status: "todo" });
+        await store.move(card.id, "ready", undefined, "agent:picus/sess-abc123");
+        await store.archive(card.id, true, "client:control-ui/ui");
+
+        // Reopen: nothing carries over but the file.
+        const second = createWorkboardSqliteStores({ dbPath });
+        const reopened = new WorkboardStore(second.cards, {
+          boards: second.boards,
+          subscriptions: second.subscriptions,
+          attachments: second.attachments,
+        });
+        const events = (await reopened.get(card.id))?.events ?? [];
+        const moved = events.find((e) => e.kind === "moved");
+        expect(moved?.actor).toBe("agent:picus/sess-abc123");
+        expect(events.at(-1)?.actor).toBe("client:control-ui/ui");
+        // `created` had no external caller and must stay unattributed.
+        expect(events.find((e) => e.kind === "created")?.actor).toBeUndefined();
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("the evidence gate on direct status changes", () => {

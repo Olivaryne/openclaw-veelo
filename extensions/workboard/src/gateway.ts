@@ -26,6 +26,42 @@ function respondError(respond: GatewayRespond, error: unknown) {
   });
 }
 
+/*
+ * Who is asking. Recorded on the card event so a mutation can be traced after
+ * the fact.
+ *
+ * On 2026-08-07 an unidentified caller closed two cards without evidence and
+ * archived 29 more. Every known writer was ruled out one by one — the Veelo
+ * archive run's own manifest, the board hygienist, the dispatch lane — and the
+ * incident still ended unattributed, because card events record what changed
+ * and when but never who. An hour of elimination produced no answer.
+ *
+ * Prefers the agent runtime identity (the gateway proves it via a signed
+ * token); falls back to the client id and mode the connection declared, which
+ * is self-reported and should be read as a hint, not proof. `sessionKey` is
+ * truncated: enough to correlate two mutations from one session without
+ * copying a full key onto every card.
+ */
+function actorOf(client: { connect?: unknown; internal?: unknown } | null | undefined): string {
+  if (!client) {
+    return "unknown";
+  }
+  const internal = client.internal as
+    | { agentRuntimeIdentity?: { agentId?: string; sessionKey?: string } }
+    | undefined;
+  const identity = internal?.agentRuntimeIdentity;
+  if (identity?.agentId) {
+    const session = identity.sessionKey ? `/${identity.sessionKey.slice(0, 12)}` : "";
+    return `agent:${identity.agentId}${session}`;
+  }
+  const connect = client.connect as { client?: { id?: string; mode?: string } } | undefined;
+  const declared = connect?.client;
+  if (declared?.id) {
+    return `client:${declared.id}${declared.mode ? `/${declared.mode}` : ""}`;
+  }
+  return "unknown";
+}
+
 function readId(params: Record<string, unknown>): string {
   const value = params.id;
   if (typeof value === "string" && value.trim()) {
@@ -116,11 +152,11 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.update",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
         respond(true, {
           card: redactClaimToken(
-            await store.update(readId(requestParams), readPatch(requestParams)),
+            await store.update(readId(requestParams), readPatch(requestParams), actorOf(client)),
           ),
         });
       } catch (error) {
@@ -132,11 +168,16 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.move",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
         respond(true, {
           card: redactClaimToken(
-            await store.move(readId(requestParams), requestParams.status, requestParams.position),
+            await store.move(
+              readId(requestParams),
+              requestParams.status,
+              requestParams.position,
+              actorOf(client),
+            ),
           ),
         });
       } catch (error) {
@@ -689,11 +730,11 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.archive",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
         respond(true, {
           card: redactClaimToken(
-            await store.archive(readId(requestParams), requestParams.archived),
+            await store.archive(readId(requestParams), requestParams.archived, actorOf(client)),
           ),
         });
       } catch (error) {

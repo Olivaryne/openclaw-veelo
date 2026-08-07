@@ -198,6 +198,68 @@ describe("WorkboardStore", () => {
     expect(review.events?.[0]).toMatchObject({ kind: "created", toStatus: "review" });
   });
 
+  describe("mutation attribution", () => {
+    /*
+     * On 2026-08-07 an unidentified caller closed two cards without evidence
+     * and archived 29 more. Every known writer was ruled out one by one and the
+     * incident still ended unattributed: events recorded what changed and when,
+     * never who.
+     */
+    it("stamps the actor on a status change", async () => {
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "attributed", status: "todo" });
+      await store.move(card.id, "ready", undefined, "agent:picus/sess-abc123");
+      const ev = (await store.get(card.id))?.events?.at(-1);
+      expect(ev).toMatchObject({
+        kind: "moved",
+        toStatus: "ready",
+        actor: "agent:picus/sess-abc123",
+      });
+    });
+
+    it("stamps the actor on an archive — the mutation that went untraced", async () => {
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "archived", status: "todo" });
+      await store.archive(card.id, true, "client:control-ui/ui");
+      const c = await store.get(card.id);
+      expect(c?.metadata?.archivedAt).toBeGreaterThan(0);
+      expect(c?.events?.at(-1)?.actor).toBe("client:control-ui/ui");
+    });
+
+    it("survives a write/read round trip", async () => {
+      // normalizeEvent whitelists fields, so an unlisted one is silently dropped
+      // on the next write-back. Two further mutations prove it persists.
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "round trip", status: "todo" });
+      await store.move(card.id, "ready", undefined, "agent:corvus/sess-zzz");
+      await store.move(card.id, "running", undefined, "agent:corvus/sess-zzz");
+      await store.move(card.id, "review", undefined, "agent:corvus/sess-zzz");
+      const events = (await store.get(card.id))?.events ?? [];
+      const moved = events.filter((e) => e.kind === "moved");
+      expect(moved).toHaveLength(3);
+      expect(moved.every((e) => e.actor === "agent:corvus/sess-zzz")).toBe(true);
+    });
+
+    it("omits the field entirely when no actor is supplied", async () => {
+      // Absent must read as "not attributed", never as a claim about who acted.
+      // Internal transitions legitimately have no external caller.
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "internal", status: "todo" });
+      await store.move(card.id, "ready", undefined);
+      const ev = (await store.get(card.id))?.events?.at(-1);
+      expect(ev?.kind).toBe("moved");
+      expect(ev && "actor" in ev).toBe(false);
+    });
+
+    it("bounds the actor string so a card cannot be used as storage", async () => {
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: "bounded", status: "todo" });
+      await store.move(card.id, "ready", undefined, "x".repeat(5000));
+      const actor = (await store.get(card.id))?.events?.at(-1)?.actor ?? "";
+      expect(actor.length).toBeLessThanOrEqual(200);
+    });
+  });
+
   describe("the evidence gate on direct status changes", () => {
     /*
      * workboard_complete has been gated since 2026-08-04, but that protected

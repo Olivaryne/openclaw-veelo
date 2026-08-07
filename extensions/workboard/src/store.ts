@@ -127,6 +127,16 @@ export type {
  */
 const EVIDENCE_GATED_STATUSES = new Set(["done"]);
 
+/** Actor strings are attribution, not storage: bounded on write AND on read. */
+const MAX_ACTOR_LENGTH = 200;
+function clampActor(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, MAX_ACTOR_LENGTH) : undefined;
+}
+
 export function requireProofMode(env: NodeJS.ProcessEnv = process.env): "enforce" | "warn" | "off" {
   const raw = (env.OPENCLAW_WORKBOARD_REQUIRE_PROOF ?? "enforce").toLowerCase();
   // Unrecognized values resolve to `enforce`, never the loosest mode — same
@@ -930,6 +940,10 @@ function normalizeEvent(value: unknown): WorkboardEvent | null {
       : undefined;
   const sessionKey = normalizeOptionalString(record.sessionKey);
   const runId = normalizeOptionalString(record.runId);
+  // normalizeEvent whitelists fields, so anything not read here is dropped on
+  // the next write-back. Truncated rather than rejected: an over-long actor is
+  // a bad caller, and refusing to READ the card would turn that into data loss.
+  const actor = clampActor(record.actor);
   return {
     id,
     kind,
@@ -938,6 +952,7 @@ function normalizeEvent(value: unknown): WorkboardEvent | null {
     ...(toStatus ? { toStatus } : {}),
     ...(sessionKey ? { sessionKey } : {}),
     ...(runId ? { runId } : {}),
+    ...(actor ? { actor } : {}),
   };
 }
 
@@ -3389,13 +3404,14 @@ export class WorkboardStore {
   private async updateMetadata(
     id: string,
     mutate: (existing: WorkboardCard) => WorkboardMetadata,
+    actor?: string,
   ): Promise<WorkboardCard> {
     return await this.enqueueMutation(async () => {
       const existing = await this.get(id);
       if (!existing) {
         throw new Error(`card not found: ${id}`);
       }
-      return await this.updateCard(id, { metadata: mutate(existing) });
+      return await this.updateCard(id, { metadata: mutate(existing) }, actor ? { actor } : {});
     });
   }
 
@@ -3732,12 +3748,13 @@ export class WorkboardStore {
     return card;
   }
 
-  async update(id: string, patch: WorkboardCardPatch): Promise<WorkboardCard> {
+  async update(id: string, patch: WorkboardCardPatch, actor?: string): Promise<WorkboardCard> {
     return await this.enqueueMutation(
       async () =>
         await this.updateCard(id, patch, {
           allowMetadataDependencyLinks: false,
           enforceStatusHolds: true,
+          ...(actor ? { actor } : {}),
           // See EVIDENCE_GATED_STATUSES. Only the PUBLIC entry point sets this:
           // completeDirect and internal transitions use updateCard directly and
           // must not be gated on work product.
@@ -3753,6 +3770,8 @@ export class WorkboardStore {
       allowMetadataDependencyLinks?: boolean;
       enforceStatusHolds?: boolean;
       enforceEvidenceOnClose?: boolean;
+      /** Who asked for this change; see WorkboardEvent.actor. */
+      actor?: string;
     } = {},
   ): Promise<WorkboardCard> {
     const existing = await this.get(id);
@@ -3887,7 +3906,14 @@ export class WorkboardStore {
     next.metadata = trimMetadataToBudget(
       syncExecutionAttemptMetadata(next.metadata ?? {}, execution, now),
     );
-    next.events = appendEvent(next, updateEvent(existing, next), now);
+    next.events = appendEvent(
+      next,
+      {
+        ...updateEvent(existing, next),
+        ...(clampActor(options.actor) ? { actor: clampActor(options.actor) } : {}),
+      },
+      now,
+    );
     if (options.enforceStatusHolds && effectivePatch.status !== undefined) {
       await this.assertActiveStatusAllowed(existing, next, now);
     }
@@ -3955,11 +3981,13 @@ export class WorkboardStore {
     }
   }
 
-  async move(id: string, status: unknown, position: unknown): Promise<WorkboardCard> {
-    return await this.update(id, {
-      status,
-      position,
-    });
+  async move(
+    id: string,
+    status: unknown,
+    position: unknown,
+    actor?: string,
+  ): Promise<WorkboardCard> {
+    return await this.update(id, { status, position }, actor);
   }
 
   // AUT-WB-ATOMIC public boundary. Deliberately not routed through enqueueMutation:
@@ -5649,12 +5677,16 @@ export class WorkboardStore {
     return { cards };
   }
 
-  async archive(id: string, archived: unknown): Promise<WorkboardCard> {
+  async archive(id: string, archived: unknown, actor?: string): Promise<WorkboardCard> {
     const shouldArchive = archived !== false;
-    return await this.updateMetadata(id, (existing) => ({
-      ...existing.metadata,
-      archivedAt: shouldArchive ? Date.now() : 0,
-    }));
+    return await this.updateMetadata(
+      id,
+      (existing) => ({
+        ...existing.metadata,
+        archivedAt: shouldArchive ? Date.now() : 0,
+      }),
+      actor,
+    );
   }
 
   async exportCards(): Promise<{

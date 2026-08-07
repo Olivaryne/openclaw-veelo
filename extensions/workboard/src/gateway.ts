@@ -140,9 +140,11 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.create",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
-        respond(true, { card: redactClaimToken(await store.create(requestParams)) });
+        respond(true, {
+          card: redactClaimToken(await store.create(requestParams, undefined, actorOf(client))),
+        });
       } catch (error) {
         respondError(respond, error);
       }
@@ -201,10 +203,17 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.comment",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
         respond(true, {
-          card: redactClaimToken(await store.addComment(readId(requestParams), requestParams)),
+          card: redactClaimToken(
+            await store.addComment(
+              readId(requestParams),
+              requestParams,
+              undefined,
+              actorOf(client),
+            ),
+          ),
         });
       } catch (error) {
         respondError(respond, error);
@@ -248,10 +257,12 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.proof",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
         respond(true, {
-          card: redactClaimToken(await store.addProof(readId(requestParams), requestParams)),
+          card: redactClaimToken(
+            await store.addProof(readId(requestParams), requestParams, undefined, actorOf(client)),
+          ),
         });
       } catch (error) {
         respondError(respond, error);
@@ -359,10 +370,12 @@ export function registerWorkboardGatewayMethods(params: {
 
   api.registerGatewayMethod(
     "workboard.cards.complete",
-    async ({ params: requestParams, respond }) => {
+    async ({ params: requestParams, respond, client }) => {
       try {
         respond(true, {
-          card: redactClaimToken(await store.complete(readId(requestParams), requestParams, null)),
+          card: redactClaimToken(
+            await store.complete(readId(requestParams), requestParams, null, actorOf(client)),
+          ),
         });
       } catch (error) {
         respondError(respond, error);
